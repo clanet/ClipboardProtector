@@ -12,4 +12,4 @@ BIP-39 规范及作者信息见 [固定修订的规范](https://github.com/bitco
 
 Detours 上游源码中的版权头、许可和其他声明继续保留。项目根目录的许可证不会替换第三方许可。
 
-正式 ZIP 包应附带本文件、根目录 `LICENSE` 和整个 `licenses/` 目录。开发工具 Gitleaks 仅用于本地与 CI 检查，不随产品分发，其许可证位于 [上游仓库](https://github.com/gitleaks/gitleaks/blob/v8.30.1/LICENSE)。
+正式 ZIP 包将根目录 `LICENSE`、`licenses/Detours-MIT.txt` 和 `licenses/BIP39-MIT.txt` 的完整文本合并在 `README.en.md` 末尾，不再单独附带许可证文件。Catch2 不参与产品构建，不随二进制包分发；源码仓库仍保留全部许可文件。开发工具 Gitleaks 仅用于本地与 CI 检查，不随产品分发，其许可证位于 [上游仓库](https://github.com/gitleaks/gitleaks/blob/v8.30.1/LICENSE)。

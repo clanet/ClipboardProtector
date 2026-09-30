@@ -85,7 +85,7 @@ cmake --build build/release/x64 --config Release
 `CLIP_X86_BIN_DIR` 必须指向已经构建好的 Win32 `bin/Release` 目录。最终
 `build/release/x64/bin/Release` 应包含 `ClipboardProtector.exe`、`HookDll.dll`、
 `HookHost32.exe`、`HookDll32.dll`、`HookDllUnloader.exe` 和
-`HookDllUnloader32.exe`。`HookHost32.exe` 是正式组件；
+`HookDllUnloader32.exe`。发布 ZIP 仅打包前四个运行组件和中英文 README，两个旧版 DLL 维护工具可自行构建。`HookHost32.exe` 是正式组件；
 `clipclient.exe` 和各 smoke 程序才会在 `BUILD_TESTING=OFF` 时排除。`BUILD_TESTING=ON` 时还会生成并注册
 CTest：`hook_smoke`、`common_smoke`、`injection_smoke`、`injector_smoke`、
 `product_single_process_smoke`、`product_coverage_smoke`（x64 且提供 Win32 `clipclient.exe` 时另有

@@ -37,14 +37,13 @@ git push -u origin main
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/package-release.ps1
 ```
 
-脚本显式设置 `BUILD_TESTING=OFF` 和 `CLIP_NO_ELEVATE=OFF`，先构建 Win32，再构建 x64。输出位于 `dist/`，包含 ZIP 和外部 SHA-256 校验文件。ZIP 内含：
+脚本显式设置 `BUILD_TESTING=OFF` 和 `CLIP_NO_ELEVATE=OFF`，先构建 Win32，再构建 x64。输出位于 `dist/`，包含 ZIP 和供发布流程内部核验的 SHA-256 文件。ZIP 内仅含以下六个文件：
 
 - `ClipboardProtector.exe`、`HookDll.dll`。
 - `HookHost32.exe`、`HookDll32.dll`。
-- `HookDllUnloader.exe`、`HookDllUnloader32.exe`。
-- 项目说明、许可证、第三方声明、文档、构建元数据和文件校验清单。
+- `readme.md`、`README.en.md`。
 
-`BUILDINFO.json` 记录版本、源码提交、工作区是否有未提交改动和工具链信息。脚本默认拒绝脏工作区；本地试打包可以显式加 `-AllowDirty`，这类包只用于检查，不能冒充对应提交的正式产物。
+打包时将项目、Detours 和 BIP-39 的完整许可文本附到英文 README 末尾；两份 README 中未随包附带的文档链接指向 GitHub 对应源码提交，移除依赖外部文件的图标。维护工具 `HookDllUnloader.exe`、`HookDllUnloader32.exe`、开发文档、独立许可证、图标源文件、`BUILDINFO.json` 和 `SHA256SUMS.txt` 不进入 ZIP。脚本默认拒绝脏工作区；本地试打包可以显式加 `-AllowDirty`，这类包带 `-local` 后缀，只用于检查，不能冒充对应提交的正式产物。
 
 核验包内容和哈希，在干净 VM 中解压验证。不应发布测试构建目录或只复制一个 EXE；当前构建没有代码签名，不得宣称已签名。
 
@@ -57,7 +56,7 @@ git tag -a v0.1.0-alpha -m "ClipboardProtector 0.1.0-alpha"
 git push origin v0.1.0-alpha
 ```
 
-tag 会触发 `Release package`：先编译正式 x86/x64 组件并上传 Actions artifact，再校验 ZIP 的 SHA-256、创建 Release 草稿并上传 ZIP 和 `.sha256`，全部成功后自动公开。版本带 `-alpha`、`-beta`、`-rc` 等后缀时标记为 pre-release，且不设为 Latest；当前 `v0.1.0-alpha` 属于预发布版本。用户可从仓库的 Releases 页面直接下载，无需进入 Actions。
+tag 会触发 `Release package`：先编译正式 x86/x64 组件并上传 Actions artifact，再使用内部 `.sha256` 文件核验 ZIP、创建 Release 草稿并仅上传 ZIP，成功后自动公开。GitHub 自带的 Source code 下载项由平台生成，不属于本脚本上传的附件。版本带 `-alpha`、`-beta`、`-rc` 等后缀时标记为 pre-release，且不设为 Latest；当前 `v0.1.0-alpha` 属于预发布版本。用户可从仓库的 Releases 页面直接下载，无需进入 Actions。
 
 只想试构建时，在 **Actions → Release package → Run workflow** 中选择 `main`。这只生成保留 30 天的 `ClipboardProtector-release-package` artifact，可登录 GitHub 后下载，不创建 Release。选择版本 tag 手动运行则会执行发布。
 

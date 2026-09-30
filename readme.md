@@ -22,7 +22,7 @@
 
 ## 获取与运行
 
-运行环境为 **Windows 10/11 x64**。版本标签推送后，GitHub Actions 会自动构建并在本仓库的 **Releases** 页面提供 ZIP 和 SHA-256 校验文件；带 `alpha` 等后缀的版本标为预发布。尚无发布包时，可按 [构建说明](doc/development.md) 从源码构建。请完整解压 ZIP，保持主程序、DLL 和辅助程序在同一目录。
+运行环境为 **Windows 10/11 x64**。版本标签推送后，GitHub Actions 会自动构建并在本仓库的 **Releases** 页面提供 ZIP；带 `alpha` 等后缀的版本标为预发布。尚无发布包时，可按 [构建说明](doc/development.md) 从源码构建。发布包仅含 `ClipboardProtector.exe`、`HookDll.dll`、`HookHost32.exe`、`HookDll32.dll` 和中英文 README。请完整解压 ZIP，保持这些文件在同一目录。
 
 1. 在测试环境启动 `ClipboardProtector.exe`。发布构建会请求管理员权限；当前预览包未进行代码签名。
 2. 从“保护 → 开启保护”启动保护，等待状态更新。菜单会随状态切换为“关闭保护”。
@@ -60,7 +60,7 @@
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/package-release.ps1
 ```
 
-输出位于 `dist/`，包含 ZIP 和 SHA-256 校验文件。编译产物统一放在 `build/`；正式程序位于 `build/release/x64/bin/Release/`。脚本默认要求工作区没有未提交改动；试打包和发布步骤见 [发布指南](doc/publishing.md)。
+输出位于 `dist/`，包含 ZIP 和供发布流程内部使用的 SHA-256 校验文件；Releases 只上传 ZIP。编译产物统一放在 `build/`；正式程序位于 `build/release/x64/bin/Release/`。脚本默认要求工作区没有未提交改动；试打包和发布步骤见 [发布指南](doc/publishing.md)。
 
 ## 反馈与参与
 
@@ -68,4 +68,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/package-release.ps1
 
 ## 许可证
 
-项目代码采用 [MIT License](LICENSE)。Microsoft Detours、BIP-39 词表及随附测试依赖保留各自许可，详见 [第三方声明](THIRD_PARTY_NOTICES.md)。
+项目代码采用 [MIT License](LICENSE)。Microsoft Detours、BIP-39 词表及随附测试依赖保留各自许可，详见 [第三方声明](THIRD_PARTY_NOTICES.md)。发布包将项目、Detours 和 BIP-39 的完整许可文本合并在 `README.en.md` 末尾。

@@ -49,7 +49,7 @@ Invoke-CMake @('-S', $repoRoot, '-B', $x64Build, '-G', 'Visual Studio 17 2022',
 Invoke-CMake @('--build', $x64Build, '--config', 'Release', '--parallel', '4')
 
 # POST_BUILD may not run if the x64 executable is already up to date.
-foreach ($name in @('HookHost32.exe', 'HookDll32.dll', 'HookDllUnloader32.exe')) {
+foreach ($name in @('HookHost32.exe', 'HookDll32.dll')) {
     Copy-Item -LiteralPath (Join-Path $x86Bin $name) -Destination (Join-Path $x64Bin $name) -Force
 }
 
@@ -71,47 +71,40 @@ $packagePath = Join-Path $stagingRoot $packageName
 [void][IO.Directory]::CreateDirectory($outputPath)
 
 # Allow only production components, never the entire build directory.
-$binaries = @('ClipboardProtector.exe', 'HookDll.dll', 'HookHost32.exe',
-    'HookDll32.dll', 'HookDllUnloader.exe', 'HookDllUnloader32.exe')
+$binaries = @('ClipboardProtector.exe', 'HookDll.dll', 'HookHost32.exe', 'HookDll32.dll')
 foreach ($name in $binaries) {
     $source = Join-Path $x64Bin $name
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing component: $name" }
     Copy-Item -LiteralPath $source -Destination (Join-Path $packagePath $name)
 }
-foreach ($name in @('readme.md', 'README.en.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'SECURITY.md',
-                    'CONTRIBUTING.md', 'CHANGELOG.md', 'VERSION')) {
-    Copy-Item -LiteralPath (Join-Path $repoRoot $name) -Destination (Join-Path $packagePath $name)
-}
-Copy-Item -LiteralPath (Join-Path $repoRoot 'licenses') -Destination (Join-Path $packagePath 'licenses') -Recurse
-[void][IO.Directory]::CreateDirectory((Join-Path $packagePath 'doc'))
-foreach ($name in @('manual.md', 'development.md', 'publishing.md', 'validation.md', 'todo.md')) {
-    Copy-Item -LiteralPath (Join-Path $repoRoot "doc/$name") -Destination (Join-Path $packagePath "doc/$name")
-}
-[void][IO.Directory]::CreateDirectory((Join-Path $packagePath 'app/assets'))
-Copy-Item -LiteralPath (Join-Path $repoRoot 'app/assets/clipboard-protector.svg') -Destination (Join-Path $packagePath 'app/assets/clipboard-protector.svg')
 
-$cmakeVersion = (& cmake --version | Select-Object -First 1)
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read CMake version.' }
-$metadata = [ordered]@{
-    version = $version
-    sourceCommit = "$commit".Trim()
-    sourceDirty = $dirty
-    builtAtUtc = [DateTime]::UtcNow.ToString('o')
-    cmake = $cmakeVersion
-    generator = 'Visual Studio 17 2022'
-    architectures = @('x64', 'Win32')
-    buildTesting = $false
-    noElevate = $false
-    codeSigned = $false
+# Keep links usable without bundling the source documentation or image assets.
+$repository = if ($env:GITHUB_REPOSITORY) { $env:GITHUB_REPOSITORY } else { 'clanet/ClipboardProtector' }
+$sourceUrl = "https://github.com/$repository/blob/$commit"
+foreach ($name in @('readme.md', 'README.en.md')) {
+    $content = [IO.File]::ReadAllText((Join-Path $repoRoot $name))
+    $content = [regex]::Replace($content, '\]\((?![a-zA-Z][a-zA-Z0-9+.-]*:|#)([^)]+)\)', {
+        param($match)
+        $target = $match.Groups[1].Value
+        if ($target -in @('readme.md', 'README.en.md')) { return $match.Value }
+        return "]($sourceUrl/$target)"
+    })
+    $content = [regex]::Replace($content, '(?m)^<img [^\r\n]+>\r?\n', '')
+    if ($name -eq 'README.en.md') {
+        # MIT notices must travel with the binaries; embed them in the README.
+        $content += "`n## Licenses`n"
+        $licenses = [ordered]@{
+            'ClipboardProtector' = 'LICENSE'
+            'Microsoft Detours' = 'licenses/Detours-MIT.txt'
+            'BIP-39 English word list' = 'licenses/BIP39-MIT.txt'
+        }
+        foreach ($license in $licenses.GetEnumerator()) {
+            $text = [IO.File]::ReadAllText((Join-Path $repoRoot $license.Value)).Trim()
+            $content += "`n### $($license.Key)`n`n$text`n"
+        }
+    }
+    [IO.File]::WriteAllText((Join-Path $packagePath $name), $content, $utf8)
 }
-[IO.File]::WriteAllText((Join-Path $packagePath 'BUILDINFO.json'), ($metadata | ConvertTo-Json -Depth 4), $utf8)
-
-$checksums = foreach ($file in (Get-ChildItem -LiteralPath $packagePath -File -Recurse | Sort-Object FullName)) {
-    $relative = $file.FullName.Substring($packagePath.Length + 1).Replace('\', '/')
-    $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-    "$hash  $relative"
-}
-[IO.File]::WriteAllText((Join-Path $packagePath 'SHA256SUMS.txt'), (($checksums -join "`n") + "`n"), $utf8)
 $zip = Join-Path $outputPath "$packageName.zip"
 Compress-Archive -LiteralPath $packagePath -DestinationPath $zip -CompressionLevel Optimal -Force
 $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()

@@ -88,7 +88,7 @@ jobs:
           )
           $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           $notes | Set-Content -LiteralPath $notesPath -Encoding utf8
-          $createArgs = @('release', 'create', $env:RELEASE_TAG, $zip, $checksum,
+          $createArgs = @('release', 'create', $env:RELEASE_TAG, $zip,
             '--repo', $env:GH_REPO, '--verify-tag', '--draft',
             '--title', "ClipboardProtector $version", '--notes-file', $notesPath)
           $publishArgs = @('release', 'edit', $env:RELEASE_TAG,
@@ -97,7 +97,7 @@ jobs:
             $createArgs += '--prerelease'
             $publishArgs += '--latest=false'
           }
-          # Upload both assets before exposing the release to users.
+          # Upload the ZIP before exposing the release to users.
           gh @createArgs
           if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release and upload its assets.' }
           gh @publishArgs

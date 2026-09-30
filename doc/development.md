@@ -20,7 +20,7 @@
 | `build/ci/` | CI 构建和测试日志 |
 | `build/tools/` | 本地下载的检查工具 |
 | `build/archive/` | 旧构建、临时脚本和日志归档；其中的 CMake 缓存不能直接复用 |
-| `dist/` | 可分发的 ZIP 包及 SHA-256 校验文件 |
+| `dist/` | 可分发的 ZIP 包及发布流程内部使用的 SHA-256 校验文件 |
 
 `tools/package-release.ps1` 默认在 `build/release/` 构建，并在其 `package-*` 子目录暂存打包内容；可通过 `-BuildRoot`、`-OutputDirectory` 覆盖默认路径。`build/` 和 `dist/` 均不提交到 Git。
 
@@ -84,7 +84,7 @@ ctest --test-dir build/dev/x64 -C Release -R '^language(_ui)?_smoke$' --output-o
 
 - `CI`：Windows Server 2022 runner，分别构建 Win32/x64，运行三项基础 smoke 和语言单元回归；通过手动运行的 `extended_tests` 可执行额外桌面测试。CI 不代表 Windows 10/11 桌面兼容性或长期稳定性验收。
 - `Secret scan`：拉取完整 Git 历史，使用固定版本与 SHA-256 校验的 Gitleaks；不上传包含发现项的报告文件。
-- `Release package`：按 `VERSION` 编译正式 x86/x64 组件，生成 ZIP、校验文件和构建元数据。版本 tag 触发时自动创建 GitHub Release 并提供下载，带后缀的版本标为预发布；手动选择 `main` 时只生成 Actions artifact。
+- `Release package`：按 `VERSION` 编译正式 x86/x64 组件，ZIP 仅含四个运行组件和中英文 README，许可文本合并到英文 README。版本 tag 触发时校验 ZIP 并自动创建 GitHub Release，仅上传 ZIP，带后缀的版本标为预发布；手动选择 `main` 时只生成 Actions artifact。SHA-256 文件仅供流程内部核验。
 
 工作流的 checkout/upload-artifact 固定到具体 commit；CI 和发布构建 job 的 token 仅有源码读取权限，checkout 不保留凭据。独立的发布 job 使用 `actions: read` 下载构建附件、`contents: write` 创建 Release，无需另配私钥或 PAT。
 

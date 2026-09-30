@@ -20,7 +20,7 @@ Monitor clipboard access on Windows and allow, block or ask about access using p
 
 Requires Windows 10/11 x64. Extract the entire release package and keep the executable, DLLs and helpers together. Release builds request administrator privileges and are currently unsigned.
 
-Download the ZIP and its SHA-256 checksum from this repository's **Releases** page. Version tags trigger automatic builds and publication; versions with an alpha, beta or rc suffix are marked as pre-releases. If no release is available yet, follow the build instructions below.
+Download the ZIP from this repository's **Releases** page. It contains only `ClipboardProtector.exe`, `HookDll.dll`, `HookHost32.exe`, `HookDll32.dll`, `readme.md` and `README.en.md`. Version tags trigger automatic builds and publication; versions with an alpha, beta or rc suffix are marked as pre-releases. If no release is available yet, follow the build instructions below.
 
 1. Start `ClipboardProtector.exe` in a test environment.
 2. Choose **Options > 语言 / Language > English**. On a fresh installation, Chinese Windows defaults to Chinese; other Windows UI languages default to English. Existing configurations without a language preference retain Chinese.
@@ -54,6 +54,6 @@ Requires Git, Visual Studio 2022 or Build Tools with C++ desktop development and
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/package-release.ps1
 ```
 
-The script requires a clean working tree by default and writes a ZIP and SHA-256 checksum to `dist/`.
+The script requires a clean working tree by default and writes a ZIP and an internal SHA-256 checksum to `dist/`. Only the ZIP is uploaded to Releases.
 
-Project code is licensed under [MIT](LICENSE). See [third-party notices](THIRD_PARTY_NOTICES.md), [contribution instructions](CONTRIBUTING.md) and [security reporting](SECURITY.md).
+Project code is licensed under [MIT](LICENSE). See [third-party notices](THIRD_PARTY_NOTICES.md), [contribution instructions](CONTRIBUTING.md) and [security reporting](SECURITY.md). The release package appends the full project, Detours and BIP-39 license texts to this English README.
