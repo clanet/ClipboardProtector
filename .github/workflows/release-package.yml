@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-package-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   package:
     runs-on: windows-2022
@@ -39,3 +43,62 @@ jobs:
             dist/*.sha256
           if-no-files-found: error
           retention-days: 30
+
+  publish:
+    needs: package
+    if: github.ref_type == 'tag'
+    runs-on: windows-2022
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+      BUILD_RUN_ID: ${{ github.run_id }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download release package
+        run: |
+          gh run download $env:BUILD_RUN_ID --repo $env:GH_REPO --name ClipboardProtector-release-package --dir dist
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the release package.' }
+      - name: Verify package and publish release
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_TAG.Substring(1)
+          $zip = "dist/ClipboardProtector-$version-windows-x64.zip"
+          $checksum = "$zip.sha256"
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = "$hash  $([IO.Path]::GetFileName($zip))"
+          if ((Get-Content -LiteralPath $checksum -Raw).Trim() -cne $expected) {
+            throw 'Release package checksum does not match.'
+          }
+          $notes = @(
+            'Windows 10/11 x64 package, including the x86 protection components.'
+            ''
+            'Extract the entire ZIP and keep the executable, DLLs, and helpers together.'
+            'This build is unsigned and requests administrator privileges.'
+            ''
+            'Experimental software: global long-running compatibility and startup after reboot have not completed validation.'
+            ''
+            "[English guide](https://github.com/$env:GH_REPO/blob/$env:RELEASE_TAG/README.en.md) | [Chinese guide](https://github.com/$env:GH_REPO/blob/$env:RELEASE_TAG/readme.md) | [Validation record](https://github.com/$env:GH_REPO/blob/$env:RELEASE_TAG/doc/validation.md)"
+          )
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          $notes | Set-Content -LiteralPath $notesPath -Encoding utf8
+          $createArgs = @('release', 'create', $env:RELEASE_TAG, $zip, $checksum,
+            '--repo', $env:GH_REPO, '--verify-tag', '--draft',
+            '--title', "ClipboardProtector $version", '--notes-file', $notesPath)
+          $publishArgs = @('release', 'edit', $env:RELEASE_TAG,
+            '--repo', $env:GH_REPO, '--draft=false')
+          if ($version.Contains('-')) {
+            $createArgs += '--prerelease'
+            $publishArgs += '--latest=false'
+          }
+          # Upload both assets before exposing the release to users.
+          gh @createArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create the draft release and upload its assets.' }
+          gh @publishArgs
+          if ($LASTEXITCODE -ne 0) { throw 'Assets uploaded, but the release is still a draft.' }

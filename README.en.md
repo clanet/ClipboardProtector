@@ -20,6 +20,8 @@ Monitor clipboard access on Windows and allow, block or ask about access using p
 
 Requires Windows 10/11 x64. Extract the entire release package and keep the executable, DLLs and helpers together. Release builds request administrator privileges and are currently unsigned.
 
+Download the ZIP and its SHA-256 checksum from this repository's **Releases** page. Version tags trigger automatic builds and publication; versions with an alpha, beta or rc suffix are marked as pre-releases. If no release is available yet, follow the build instructions below.
+
 1. Start `ClipboardProtector.exe` in a test environment.
 2. Choose **Options > 语言 / Language > English**. On a fresh installation, Chinese Windows defaults to Chinese; other Windows UI languages default to English. Existing configurations without a language preference retain Chinese.
 3. Choose **Protection > Enable protection** to cover compatible desktop applications. Use disposable content to test access rules.

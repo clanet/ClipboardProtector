@@ -84,9 +84,9 @@ ctest --test-dir build/dev/x64 -C Release -R '^language(_ui)?_smoke$' --output-o
 
 - `CI`：Windows Server 2022 runner，分别构建 Win32/x64，运行三项基础 smoke 和语言单元回归；通过手动运行的 `extended_tests` 可执行额外桌面测试。CI 不代表 Windows 10/11 桌面兼容性或长期稳定性验收。
 - `Secret scan`：拉取完整 Git 历史，使用固定版本与 SHA-256 校验的 Gitleaks；不上传包含发现项的报告文件。
-- `Release package`：按 `VERSION` 编译正式 x86/x64 组件，生成 ZIP、校验文件和构建元数据，只上传 Actions artifact，不创建 GitHub Release。
+- `Release package`：按 `VERSION` 编译正式 x86/x64 组件，生成 ZIP、校验文件和构建元数据。版本 tag 触发时自动创建 GitHub Release 并提供下载，带后缀的版本标为预发布；手动选择 `main` 时只生成 Actions artifact。
 
-工作流的 checkout/upload-artifact 固定到具体 commit；CI 的 token 仅有源码读取权限，checkout 不保留凭据。
+工作流的 checkout/upload-artifact 固定到具体 commit；CI 和发布构建 job 的 token 仅有源码读取权限，checkout 不保留凭据。独立的发布 job 使用 `actions: read` 下载构建附件、`contents: write` 创建 Release，无需另配私钥或 PAT。
 
 ## 敏感信息检查
 

@@ -50,13 +50,17 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/package-release.ps1
 
 ## GitHub Release
 
-确认源码提交、CI、包内容和已知限制后，再创建并推送与 `VERSION` 一致的 tag：
+确认源码提交、CI、包内容和已知限制后，再创建并推送与 `VERSION` 一致的 tag。推送 tag 会自动构建并公开下载包：
 
 ```powershell
 git tag -a v0.1.0-alpha -m "ClipboardProtector 0.1.0-alpha"
 git push origin v0.1.0-alpha
 ```
 
-tag 会触发 `Release package`，也可手动运行它。下载该次 Actions artifact，解压后核验 ZIP 及 `.sha256`；工作流不会自动创建或公开 Release。
+tag 会触发 `Release package`：先编译正式 x86/x64 组件并上传 Actions artifact，再校验 ZIP 的 SHA-256、创建 Release 草稿并上传 ZIP 和 `.sha256`，全部成功后自动公开。版本带 `-alpha`、`-beta`、`-rc` 等后缀时标记为 pre-release，且不设为 Latest；当前 `v0.1.0-alpha` 属于预发布版本。用户可从仓库的 Releases 页面直接下载，无需进入 Actions。
 
-在 GitHub 创建 Draft Release，选中同一 tag，勾选 **Set as a pre-release**，附上 ZIP、`.sha256`、本版变更与已知限制。最后人工确认后发布。尚未完成的事务/长期稳定性测试必须明确列出，不写“全场景验证通过”。
+只想试构建时，在 **Actions → Release package → Run workflow** 中选择 `main`。这只生成保留 30 天的 `ClipboardProtector-release-package` artifact，可登录 GitHub 后下载，不创建 Release。选择版本 tag 手动运行则会执行发布。
+
+流程使用 GitHub 自动提供的 `GITHUB_TOKEN`，不需要上传本地 SSH 私钥或另配 PAT。只有发布 job 获得 `contents: write`；构建 job 保持只读权限。若组织策略限制该权限，需要在 GitHub 端允许工作流创建 Release。
+
+发布流程不覆盖已有的同名 Release；重复发布该 tag 会失败。新版本应更新 `VERSION` 和 `CHANGELOG.md` 并使用新 tag。若上传或公开步骤失败，先检查保留的草稿及附件，再修复或删除该草稿后重跑。尚未完成的事务/长期稳定性测试必须明确列出，不写“全场景验证通过”。
