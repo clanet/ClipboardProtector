@@ -505,10 +505,9 @@ INT_PTR CALLBACK RulesProc(HWND dialog, UINT message, WPARAM wParam,
             rule.name = UiText(TextId::NewRule);
             rule.pattern = L"*";
             if (EditRule(dialog, rule)) {
-                work.push_back(std::move(rule));
+                work.insert(work.begin(), std::move(rule));
                 changed = true;
-                RefreshRuleList(dialog, work,
-                                static_cast<int>(work.size()) - 1);
+                RefreshRuleList(dialog, work, 0);
             }
             return TRUE;
         }

@@ -1,6 +1,7 @@
 #include "config.h"
 #include "i18n.h"
 #include "ipc.h"
+#include "rules.h"
 #include "../app/resource.h"
 #include <windows.h>
 #include <commctrl.h>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -53,7 +55,64 @@ struct TempConfig {
     }
 };
 
+void FirstRunConfigTests() {
+    for (Language language : {Language::Chinese, Language::English}) {
+        TempConfig temp;
+        const Config initial = MakeFirstRunConfig(language);
+        CHECK(initial.Save(temp.file));
+        Config loaded;
+        CHECK(loaded.Load(temp.file));
+        CHECK(loaded.settings.language == language);
+        CHECK(loaded.settings.shortcutDirectAllow && loaded.settings.cryptoProtection);
+        CHECK(loaded.rules.size() == 2 && IsRuleSetSupported(loaded.rules));
+        CHECK(loaded.rules[0].name == UiText(TextId::DefaultNonTextSilentRule, language));
+        CHECK(loaded.rules[1].name == UiText(TextId::DefaultClipboardNotifyRule, language));
+
+        std::vector<RuleLite> rules;
+        for (const auto& rule : loaded.rules) {
+            RuleLite lite;
+            lite.patternLower = rule.pattern;
+            lite.isPath = rule.isPath;
+            lite.action = rule.action;
+            lite.showNotification = rule.showNotification;
+            lite.hideFromLogList = rule.hideFromLogList;
+            lite.name = rule.name;
+            lite.operations = rule.operations;
+            lite.format = rule.format;
+            lite.enabled = rule.enabled;
+            lite.sourceMode = rule.sourceMode;
+            rules.push_back(std::move(lite));
+        }
+        for (const unsigned char operation : {kRuleRead, kRuleWrite}) {
+            for (bool text : {false, true}) {
+                RuleMatch match;
+                CHECK(FindClipboardRule(rules, L"example.exe", L"c:\\example.exe",
+                                        123, operation, text, {}, nullptr, false, match));
+                CHECK(match.action == kRuleAllow && !match.hideFromLogList);
+                CHECK(match.showNotification == text);
+                CHECK(match.name == loaded.rules[text ? 1 : 0].name);
+            }
+        }
+
+        loaded.rules.resize(1);
+        loaded.rules[0].name = L"My custom rule";
+        loaded.rules[0].enabled = false;
+        CHECK(loaded.Save(temp.file));
+        Config customized;
+        CHECK(customized.Load(temp.file) && customized.rules.size() == 1);
+        CHECK(customized.rules[0].name == L"My custom rule" && !customized.rules[0].enabled);
+        customized.rules.clear();
+        CHECK(customized.Save(temp.file));
+        Config empty;
+        CHECK(empty.Load(temp.file) && empty.rules.empty());
+        temp.Write("{}");
+        Config legacy;
+        CHECK(legacy.Load(temp.file) && legacy.rules.empty());
+    }
+}
+
 void UnitTests() {
+    FirstRunConfigTests();
     for (int i = 0; i < static_cast<int>(TextId::TextCount); ++i) {
         const auto id = static_cast<TextId>(i);
         CHECK(*UiText(id, Language::Chinese));
@@ -61,6 +120,8 @@ void UnitTests() {
     }
     TempConfig temp;
     Config config;
+    CHECK(config.settings.cryptoProtection);
+    CHECK(config.settings.shortcutDirectAllow);
     Rule rule;
     rule.pattern = L"example.exe";
     rule.name = UiText(TextId::BuiltinCryptoReplacement, Language::Chinese);
@@ -72,6 +133,8 @@ void UnitTests() {
         Config loaded;
         CHECK(loaded.Load(temp.file));
         CHECK(loaded.settings.language == language && loaded.rules[0].name == rule.name);
+        CHECK(loaded.settings.cryptoProtection);
+        CHECK(loaded.settings.shortcutDirectAllow);
         CHECK(DisplayRuleName(rule.name, BuiltinRule::None) == rule.name);
         CHECK(DisplayRuleName(rule.name, BuiltinRule::CryptoReplacement) == UiText(TextId::BuiltinCryptoReplacement));
         const std::wstring userText = UiText(TextId::CryptoAddressHidden, Language::Chinese);
@@ -87,7 +150,17 @@ void UnitTests() {
         legacy.settings.language = Language::English;
         CHECK(legacy.Load(temp.file));
         CHECK(legacy.settings.language == Language::Chinese);
+        CHECK(legacy.settings.cryptoProtection);
+        CHECK(legacy.settings.shortcutDirectAllow);
     }
+    temp.Write("{\"settings\":{\"cryptoProtection\":false,\"shortcutDirectAllow\":false},\"rules\":[]}");
+    Config disabledCrypto;
+    CHECK(disabledCrypto.Load(temp.file) && !disabledCrypto.settings.cryptoProtection);
+    CHECK(!disabledCrypto.settings.shortcutDirectAllow);
+    CHECK(disabledCrypto.Save(temp.file));
+    Config disabledReloaded;
+    CHECK(disabledReloaded.Load(temp.file) && !disabledReloaded.settings.cryptoProtection);
+    CHECK(!disabledReloaded.settings.shortcutDirectAllow);
     temp.Write("{\"settings\":{\"language\":\"en\"},\"rules\":[]}");
     Config english;
     CHECK(english.Load(temp.file) && english.settings.language == Language::English);
@@ -189,10 +262,14 @@ struct MockClient {
         CHECK(WriteFile(pipe, frame.data(), static_cast<DWORD>(frame.size()), &written, nullptr) && written == frame.size());
     }
     void Connect(const std::wstring& name) {
-        CHECK(Wait([&] {
+        DWORD connectError = ERROR_SUCCESS;
+        const bool connected = Wait([&] {
             pipe = CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (pipe == INVALID_HANDLE_VALUE) connectError = GetLastError();
             return pipe != INVALID_HANDLE_VALUE;
-        }));
+        });
+        if (!connected)
+            throw std::runtime_error("Mock pipe connection failed, Win32=" + std::to_string(connectError));
         worker = std::thread([this] {
             std::string input;
             bool extended = false;
@@ -254,6 +331,11 @@ void UiTests(const wchar_t* path) {
     config.settings.language = Language::Chinese;
     config.settings.startMinimized = true;
     config.settings.balloonNotificationsDisabled = true;
+    config.settings.cryptoProtection = false;
+    Rule existing;
+    existing.name = L"Existing rule";
+    existing.pattern = L"existing.exe";
+    config.rules.push_back(existing);
     CHECK(config.Save(temp.file));
     const std::wstring suffix = std::to_wstring(GetCurrentProcessId());
     const std::wstring pipeName = L"\\\\.\\pipe\\ClipboardProtector.LanguageSmoke." + suffix;
@@ -272,6 +354,8 @@ void UiTests(const wchar_t* path) {
     client.Event(BuiltinRule::CryptoReplacement, PreviewKind::CryptoAddress);
     HWND list = GetDlgItem(app.window, 102);
     CHECK(Wait([&] { return ListView_GetItemCount(list) == 2; }));
+    CHECK(SendMessageW(app.window, WM_APP + 62, 123, 0) == 1);
+    CHECK(ListView_GetItemCount(list) == 3);
     client.Confirmation();
     HWND confirmation = nullptr;
     CHECK(Wait([&] { confirmation = Find(app.process.dwProcessId, L"ClipProtectorConfirmWnd"); return confirmation != nullptr; }));
@@ -286,10 +370,15 @@ void UiTests(const wchar_t* path) {
         CHECK(SendMessageW(GetDlgItem(confirmation, 4103), BM_GETCHECK, 0, 0) == BST_CHECKED);
         HMENU menu = GetSubMenu(GetSubMenu(GetMenu(app.window), 2), 4);
         CHECK((GetMenuState(menu, command, MF_BYCOMMAND) & MF_CHECKED) != 0);
-        CHECK(app.Cell(0, 7) == UiText(TextId::BuiltinCryptoReplacement, language));
-        CHECK(app.Cell(0, 10) == UiText(TextId::CryptoAddressHidden, language));
-        CHECK(app.Cell(1, 7) == UiText(TextId::BuiltinCryptoReplacement, Language::Chinese));
-        CHECK(app.Cell(1, 10) == UiText(TextId::CryptoAddressHidden, Language::Chinese));
+        CHECK(app.Cell(0, 5) == UiText(TextId::ClipboardContentChanged, language));
+        CHECK(app.Cell(0, 7) == UiText(TextId::CryptoClipboardMonitor, language));
+        CHECK(app.Cell(0, 8) == UiText(TextId::ChangeAlert, language));
+        CHECK(app.Cell(0, 10) == UiText(TextId::CryptoClipboardChangedContent, language));
+        CHECK(app.Cell(0, 11) == UiText(TextId::CryptoChanged, language));
+        CHECK(app.Cell(1, 7) == UiText(TextId::BuiltinCryptoReplacement, language));
+        CHECK(app.Cell(1, 10) == UiText(TextId::CryptoAddressHidden, language));
+        CHECK(app.Cell(2, 7) == UiText(TextId::BuiltinCryptoReplacement, Language::Chinese));
+        CHECK(app.Cell(2, 10) == UiText(TextId::CryptoAddressHidden, Language::Chinese));
         Config saved;
         CHECK(saved.Load(temp.file) && saved.settings.language == language);
         CHECK(!saved.settings.startGlobalProtection);
@@ -313,8 +402,19 @@ void UiTests(const wchar_t* path) {
             CHECK(Wait([&] { editor = Find(app.process.dwProcessId, L"#32770");
                             return editor && WindowText(editor) == L"Edit rule"; }));
             CHECK(WindowText(GetDlgItem(editor, IDOK)) == L"Save");
-            PostMessageW(editor, WM_COMMAND, IDCANCEL, 0);
+            CHECK(SetDlgItemTextW(editor, IDC_ED_RULE_NAME, L"Newest rule"));
+            PostMessageW(editor, WM_COMMAND, IDOK, 0);
             CHECK(Wait([&] { return !IsWindow(editor); }));
+            HWND ruleList = GetDlgItem(dialog, IDC_LIST_RULES);
+            CHECK(ListView_GetItemCount(ruleList) == 2);
+            CHECK(ListView_GetNextItem(ruleList, -1, LVNI_SELECTED) == 0);
+            PostMessageW(dialog, WM_COMMAND, IDOK, 0);
+            CHECK(Wait([&] { return !IsWindow(dialog); }));
+            Config savedRules;
+            CHECK(savedRules.Load(temp.file) && savedRules.rules.size() == 2);
+            CHECK(savedRules.rules[0].name == L"Newest rule");
+            CHECK(savedRules.rules[1].name == L"Existing rule");
+            continue;
         }
         PostMessageW(dialog, WM_COMMAND, IDCANCEL, 0);
         CHECK(Wait([&] { return !IsWindow(dialog); }));

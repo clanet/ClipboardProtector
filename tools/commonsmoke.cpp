@@ -7,6 +7,7 @@
 #include "../common/winutil.h"
 #include <windows.h>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <utility>
@@ -195,9 +196,32 @@ bool CheckIpcStrings() {
         actual == L"previous value";
 }
 
+bool CheckCryptoObservation() {
+    const std::wstring a = L"0x1111111111111111111111111111111111111111";
+    const std::wstring b = L"0x2222222222222222222222222222222222222222";
+    clip::CryptoAddressTracker tracker;
+    if (tracker.Update(L"ordinary text") || tracker.active()) return false;
+    if (tracker.Update(a) || !tracker.active()) return false;
+    if (tracker.Update(L"Send to " + a + L".") || !tracker.active()) return false;
+    if (!tracker.Update(a + L" " + b)) return false;
+    if (tracker.Update(b + L" " + a)) return false;
+    if (!tracker.Update(a + L" " + a)) return false;
+    if (!tracker.Update(a)) return false;
+    if (tracker.Update(std::wstring(clip::kMaxCryptoTextLength + 1, L'x')) ||
+        !tracker.active()) return false;
+    if (!tracker.Update(b) || tracker.Update(b)) return false;
+    if (!tracker.Update(L"") || tracker.active() || tracker.Update(L"")) return false;
+    if (tracker.Update(a)) return false;
+    tracker.Reset();
+    return !tracker.active() && !tracker.Update(b) && tracker.active();
+}
+
 } // namespace
 
 int wmain() {
+    if (!clip::Settings{}.cryptoProtection ||
+        !clip::Settings{}.shortcutDirectAllow) return 125;
+    if (!CheckCryptoObservation()) return 126;
     if (!CheckStateAcks()) return 123;
     if (!CheckIpcStrings()) return 124;
     clip::CryptoAddressKind cryptoKind = clip::kCryptoAddressNone;
@@ -594,6 +618,7 @@ int wmain() {
         std::to_wstring(GetTickCount64());
     HANDLE firstMutex =
         clip::CreateLocalUserNamedMutex(mutexName.c_str(), FALSE);
+    const DWORD firstMutexError = GetLastError();
     HANDLE secondMutex = firstMutex
         ? clip::CreateLocalUserNamedMutex(mutexName.c_str(), FALSE)
         : nullptr;
@@ -601,8 +626,11 @@ int wmain() {
     if (secondMutex) CloseHandle(secondMutex);
     if (firstMutex) CloseHandle(firstMutex);
     if (!firstMutex || !secondMutex ||
-        secondMutexError != ERROR_ALREADY_EXISTS)
+        secondMutexError != ERROR_ALREADY_EXISTS) {
+        std::fprintf(stderr, "named-mutex first=%lu second=%lu\n",
+                     firstMutexError, secondMutexError);
         return 118;
+    }
 
 
     clip::RuleLite truncatedBlock = contentRule;
@@ -801,7 +829,8 @@ int wmain() {
         config.rules[0].isPath ||
         !config.settings.startGlobalProtection ||
         !config.settings.startMinimized ||
-        !config.settings.ignoreCustomFormats)
+        !config.settings.ignoreCustomFormats || config.settings.cryptoProtection ||
+        config.settings.shortcutDirectAllow)
         return 11;
 
     wchar_t legacySettingsName[MAX_PATH] = {};
@@ -819,9 +848,9 @@ int wmain() {
     if (!legacySettingsLoaded ||
         !legacySettings.settings.balloonNotificationsDisabled ||
         legacySettings.settings.shortcutOnlyMode ||
-        legacySettings.settings.shortcutDirectAllow ||
+        !legacySettings.settings.shortcutDirectAllow ||
         legacySettings.settings.shortcutAuthorizationWindowMs != 1000 ||
-        legacySettings.settings.cryptoProtection ||
+        !legacySettings.settings.cryptoProtection ||
         !legacySettings.settings.ignoreCustomFormats ||
         legacySettings.settings.startGlobalProtection ||
         legacySettings.settings.startMinimized ||

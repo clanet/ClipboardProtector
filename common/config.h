@@ -58,10 +58,10 @@ struct Settings {
     AppHotkeys hotkeys;
     bool balloonNotificationsDisabled = false;
     bool shortcutOnlyMode = false;
-    bool shortcutDirectAllow = false;
+    bool shortcutDirectAllow = true;
     unsigned int shortcutAuthorizationWindowMs =
         kDefaultShortcutAuthorizationWindowMs;
-    bool cryptoProtection = false;
+    bool cryptoProtection = true;
     int maxLogEntries = 5000;
     bool previewEnabled = true;
     bool captureImageFileSnapshots = false;
@@ -104,6 +104,9 @@ struct Config {
     int MatchAction(const std::wstring& processNameLower,
                     const std::wstring& fullPathLower) const;
 };
+
+// Used only when the application starts without a configuration file.
+Config MakeFirstRunConfig(Language language);
 
 std::wstring DefaultConfigDir();          // %APPDATA%\ClipboardProtector
 std::wstring DefaultConfigPath();         // ...\config.json

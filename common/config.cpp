@@ -139,6 +139,22 @@ static bool RulesFromJson(const minjson::Value& arr, int ruleModelVersion,
     return true;
 }
 
+Config MakeFirstRunConfig(Language language) {
+    Config config;
+    config.settings.language = language;
+    Rule nonText;
+    nonText.name = UiText(TextId::DefaultNonTextSilentRule, language);
+    nonText.pattern = L"*";
+    nonText.format = kFormatNonText;
+    config.rules.push_back(std::move(nonText));
+    Rule notify;
+    notify.name = UiText(TextId::DefaultClipboardNotifyRule, language);
+    notify.pattern = L"*";
+    notify.showNotification = true;
+    config.rules.push_back(std::move(notify));
+    return config;
+}
+
 bool Config::Load(const std::wstring& path) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -206,7 +222,7 @@ bool Config::Load(const std::wstring& path) {
         parsedSettings.shortcutOnlyMode =
             settingsValue.get(L"shortcutOnlyMode").asBool(false);
         parsedSettings.shortcutDirectAllow =
-            settingsValue.get(L"shortcutDirectAllow").asBool(false);
+            settingsValue.get(L"shortcutDirectAllow").asBool(true);
         const long long shortcutWindowMs = settingsValue
             .get(L"shortcutAuthorizationWindowMs")
             .asInt(kDefaultShortcutAuthorizationWindowMs);
@@ -215,7 +231,7 @@ bool Config::Load(const std::wstring& path) {
                 shortcutWindowMs, kMinShortcutAuthorizationWindowMs,
                 kMaxShortcutAuthorizationWindowMs));
         parsedSettings.cryptoProtection =
-            settingsValue.get(L"cryptoProtection").asBool(false);
+            settingsValue.get(L"cryptoProtection").asBool(true);
         const long long ml =
             settingsValue.get(L"maxLogEntries").asInt(5000);
         parsedSettings.maxLogEntries = (int)std::clamp<long long>(ml, 100, 100000);

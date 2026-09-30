@@ -15,6 +15,7 @@
 #include "autostart.h"
 #include "confirmwnd.h"
 #include "privateclipboard.h"
+#include "cryptomonitor.h"
 
 namespace clip {
 
@@ -97,6 +98,8 @@ private:
     void CopyLogContent(int index);
     void FocusNotifiedRow();
     void FlushDueNotifications();
+    void PollCryptoChanges();
+    void RecordCryptoChange(const CryptoClipboardChange& change);
     void ShowContextMenu(int x, int y);
     void ShowMainWindow();
     void ToggleVisible();
@@ -169,6 +172,8 @@ private:
     bool privateHotkeysRegistered_ = false;
     std::wstring hotkeyRegistrationError_;
     PrivateClipboard privateClipboard_;
+    CryptoClipboardMonitor cryptoMonitor_;
+    bool cryptoMonitorAvailable_ = false;
     bool rulesDialogOpen_ = false;
     bool blockedOnly_ = false;
 };

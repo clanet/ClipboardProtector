@@ -39,6 +39,18 @@ bool ExtractCryptoAddresses(const std::wstring& text,
 bool HasCryptoAddressReplacement(const std::vector<CryptoAddress>& before,
                                  const std::vector<CryptoAddress>& after);
 
+// Independent observation: warn when an existing address set changes, including
+// removal. Ordinary prose edits and address ordering do not change the baseline.
+class CryptoAddressTracker {
+public:
+    bool Update(const std::wstring& text);
+    bool active() const { return !addresses_.empty(); }
+    void Reset() { addresses_.clear(); }
+
+private:
+    std::vector<CryptoAddress> addresses_;
+};
+
 // Matches a complete supported private key or a validated 12/24-word English
 // BIP-39 mnemonic. Addresses are deliberately handled by ParseCryptoAddress.
 bool IsPrivateKeyOrMnemonicContent(const std::wstring& text);

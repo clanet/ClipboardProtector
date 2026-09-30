@@ -9,9 +9,10 @@ Monitor clipboard access on Windows and allow, block or ask about access using p
 ## Features
 
 - Clipboard access log, filters, details and CSV export.
-- Ordered rules for process names/paths, source processes, read/write operations, formats and text patterns.
+- Ordered rules for process names/paths, source processes, read/write operations, formats and text patterns. New rules go to the top and match first.
 - Allow, block or ask for each access, with independent notification and log visibility settings.
-- Optional BTC / ETH / SOL address replacement protection.
+- Copy/paste shortcut operations bypass ordinary rules by default and remain logged; an existing explicit off setting is preserved.
+- BTC / ETH / SOL address protection, enabled by default for new configurations. An independent clipboard monitor logs address changes and displays tray alerts; injected processes also support replacement blocking.
 - Private text clipboard stored in memory, with configurable copy/paste shortcuts.
 - Tray controls, persistent settings and optional Windows startup.
 - Chinese and English interfaces in the same executable.
@@ -25,10 +26,14 @@ Download the ZIP from this repository's **Releases** page. It contains only `Cli
 1. Start `ClipboardProtector.exe` in a test environment.
 2. Choose **Options > 语言 / Language > English**. On a fresh installation, Chinese Windows defaults to Chinese; other Windows UI languages default to English. Existing configurations without a language preference retain Chinese.
 3. Choose **Protection > Enable protection** to cover compatible desktop applications. Use disposable content to test access rules.
-4. Enable Crypto address protection in Settings if needed. User-initiated Ctrl+C / Ctrl+Insert permits updating the protected address; ordinary access rules remain independent.
+4. Crypto address protection is enabled by default; an existing explicit off setting is preserved. Adjust it in Settings. User-initiated Ctrl+C / Ctrl+Insert permits updating the protected address; ordinary access rules remain independent.
 5. To stop, disable protection or choose **Window > Exit**. Closing the main window hides it to the tray.
 
 Changing language updates the interface without restarting protection. Your rule names, clipboard text, process names and paths remain unchanged. CSV headings and status descriptions use the selected language. System-owned dialogs may follow the Windows display language.
+
+The first configuration includes two ordered rules: "Silent non-text reads and writes", followed by "Clipboard read and write notifications". Both allow access and retain logs; non-text access is silent, while other access triggers notifications. Existing configurations and deliberately emptied rule lists are preserved. Copy/paste shortcut operations bypass these ordinary rules when direct allowance is enabled.
+
+Address change alerts also work for processes that have not been injected. These events are marked as changed, not blocked, and do not restore the clipboard. Monitoring continues when global injection is disabled; pause protection, disable the Crypto option or exit to stop it. Tray alerts respect the notification setting, and address text stays hidden in logs.
 
 ## Private clipboard
 

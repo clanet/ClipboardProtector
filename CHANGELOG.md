@@ -4,6 +4,10 @@
 
 首个公开开发预览版本，发布日期以 GitHub Release 为准。
 
+- Enable Crypto address protection by default while preserving existing explicit off settings. Independently monitor clipboard address changes and report them through redacted logs and tray notifications, including changes made by uninjected processes. Observed changes are not reported as blocked.
+- Insert new rules at the top of the list, including rules added from access logs.
+- Enable "Allow copy/paste shortcuts without checking rules" by default while preserving existing explicit off settings.
+- Add "Silent non-text reads and writes" and "Clipboard read and write notifications" when creating the first configuration. Preserve existing configurations and deliberately emptied rule lists.
 - 推送版本标签后，GitHub Actions 自动构建并发布 ZIP；alpha 等版本自动标记为预发布。ZIP 仅含四个运行组件和中英文 README，许可文本合并到英文 README，SHA-256 文件仅用于发布流程内部核验。
 - 内置中文和英文界面；通过语言菜单即时切换并保存选择，保留用户内容与保护状态。
 - 修复 Base58 格式识别误接受内嵌空字符的问题。

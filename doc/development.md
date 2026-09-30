@@ -48,6 +48,12 @@ ctest --test-dir build/dev/x64 -C Release -R '^(common_smoke|hook_smoke|injectio
 
 `injection_smoke` 只向自己创建的子进程注入。完整复制事务子用例使用私有窗口站；如果系统拒绝创建，输出 `crypto-transactions-skipped=private-window-station-unavailable`，其余无 `OpenClipboard` 的用例仍执行。CTest 的整体通过不代表该子用例已执行。
 
+`crypto_monitor_smoke` 使用替代剪贴板读取器验证后台地址变化监测，覆盖不变内容去重、无序列号变化的内容修改、读取失败重试、暂停/重启基线和读取阻塞时的有界退出，不读取或修改系统剪贴板：
+
+```powershell
+ctest --test-dir build/dev/x64 -C Release -R '^crypto_monitor_smoke$' --output-on-failure
+```
+
 ## 桌面和端到端回归
 
 在专用、可丢弃的 Windows 测试环境中执行完整 CTest：
@@ -82,7 +88,7 @@ ctest --test-dir build/dev/x64 -C Release -R '^language(_ui)?_smoke$' --output-o
 
 ## GitHub Actions
 
-- `CI`：Windows Server 2022 runner，分别构建 Win32/x64，运行三项基础 smoke 和语言单元回归；通过手动运行的 `extended_tests` 可执行额外桌面测试。CI 不代表 Windows 10/11 桌面兼容性或长期稳定性验收。
+- `CI`：Windows Server 2022 runner，分别构建 Win32/x64，运行三项基础 smoke、语言单元回归和地址变化监测回归；通过手动运行的 `extended_tests` 可执行额外桌面测试。CI 不代表 Windows 10/11 桌面兼容性或长期稳定性验收。
 - `Secret scan`：拉取完整 Git 历史，使用固定版本与 SHA-256 校验的 Gitleaks；不上传包含发现项的报告文件。
 - `Release package`：按 `VERSION` 编译正式 x86/x64 组件，ZIP 仅含四个运行组件和中英文 README，许可文本合并到英文 README。版本 tag 触发时校验 ZIP 并自动创建 GitHub Release，仅上传 ZIP，带后缀的版本标为预发布；手动选择 `main` 时只生成 Actions artifact。SHA-256 文件仅供流程内部核验。
 

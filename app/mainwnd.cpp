@@ -97,7 +97,8 @@ std::wstring FormatName(UINT fmt) {
     }
 }
 
-static std::wstring OpName(BYTE op) {
+static std::wstring OpName(BYTE op, bool cryptoChanged = false) {
+    if (cryptoChanged) return UiText(TextId::ClipboardContentChanged);
     switch (op) {
         case kOpRead:  return UiText(TextId::Read);
         case kOpWrite: return UiText(TextId::Write);
@@ -107,7 +108,8 @@ static std::wstring OpName(BYTE op) {
     }
 }
 
-static std::wstring DecisionName(BYTE action) {
+static std::wstring DecisionName(BYTE action, bool cryptoChanged = false) {
+    if (cryptoChanged) return UiText(TextId::ChangeAlert);
     switch (action) {
         case kRuleAllow:
         case kRuleShow: return UiText(TextId::Allow);
@@ -119,6 +121,11 @@ static std::wstring DecisionName(BYTE action) {
 
 static const wchar_t* NotificationName(bool showNotification) {
     return showNotification ? UiText(TextId::TrayNotification) : UiText(TextId::Silent);
+}
+
+static std::wstring LogRuleName(const LogRow& row) {
+    return row.cryptoChanged ? UiText(TextId::CryptoClipboardMonitor)
+                            : DisplayRuleName(row.ruleName, row.builtinRule);
 }
 
 static HGLOBAL CopyToGlobalMemory(const void* data, SIZE_T bytes) {
@@ -314,11 +321,13 @@ static std::wstring SnapshotSummary(const LogRow& row) {
 }
 
 static std::wstring LogContentSummary(const LogRow& row) {
+    if (row.cryptoChanged) return UiText(TextId::CryptoClipboardChangedContent);
     return row.preview.empty() && row.previewKind == PreviewKind::Text
         ? SnapshotSummary(row) : DisplayPreview(row.preview, row.previewKind);
 }
 
 static bool CanCopyLogContent(const LogRow& row) {
+    if (row.cryptoChanged) return false;
     if (!row.preview.empty()) return true;
     if (row.snapshotKind == kSnapshotImage) {
         DWORD width = 0, height = 0;
@@ -332,12 +341,19 @@ static bool CanCopyLogContent(const LogRow& row) {
 }
 
 static std::wstring NotificationTitle(const LogRow& row) {
+    if (row.cryptoChanged) return UiText(TextId::CryptoClipboardChangedTitle);
     if (row.blocked) return UiText(TextId::ClipboardAccessBlocked);
     return row.op == kOpWrite ? UiText(TextId::ClipboardWrite) :
            row.op == kOpClear ? UiText(TextId::ClipboardClear) : UiText(TextId::ClipboardRead);
 }
 
 static std::wstring NotificationText(const LogRow& row, DWORD merged) {
+    if (row.cryptoChanged) {
+        std::wstring text = UiText(TextId::CryptoClipboardChangedNotice);
+        if (merged > 1)
+            text += UiFormat(TextId::MergedNotificationCount, {std::to_wstring(merged)});
+        return text;
+    }
     std::wstring text =
         UiText(TextId::Process2) + (row.process.empty() ? UiText(TextId::Unknown) : row.process);
     if (row.pid) text += L" (PID " + std::to_wstring(row.pid) + L")";
@@ -655,10 +671,14 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_TIMER:
         if (wp == kNotifyTimerId) {
+            PollCryptoChanges();
             FlushDueNotifications();
             return 0;
         }
         break;
+    case WM_CLIPBOARDUPDATE:
+        cryptoMonitor_.Wake();
+        return 0;
     case WM_INITMENUPOPUP:
         if (!HIWORD(lp)) {
             SyncMenuState();
@@ -670,6 +690,13 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         return (privateClipboard_.Busy() ? 1 : 0) | (privateClipboard_.HasText() ? 2 : 0);
     case WM_APP + 61:
         return SetWindowTextW(hwnd_, privateClipboard_.DiagnosticStatusForTest());
+    case WM_APP + 62: {
+        CryptoClipboardChange change;
+        change.sequence = static_cast<DWORD>(wp);
+        GetLocalTime(&change.time);
+        RecordCryptoChange(change);
+        return 1;
+    }
 #endif
     case WM_HOTKEY:
         if (wp == kPrivateCopyHotkeyId || wp == kPrivatePasteHotkeyId) {
@@ -1030,6 +1057,8 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         UnregisterHotkeys();
         privateClipboard_.Stop();
+        RemoveClipboardFormatListener(hwnd_);
+        cryptoMonitor_.Stop();
         confirmations_.clear();
         SaveWindowSize();
         KillTimer(hwnd_, kNotifyTimerId);
@@ -1103,6 +1132,10 @@ void MainWindow::OnCreate() {
     SYSTEMTIME st;
     GetLocalTime(&st);
     g_app.todayDay = (WORD)(st.wMonth * 100 + st.wDay);
+    cryptoMonitorAvailable_ = cryptoMonitor_.Start();
+    // The periodic worker also covers listener registration failure.
+    AddClipboardFormatListener(hwnd_);
+    PollCryptoChanges();
     SetTimer(hwnd_, kNotifyTimerId, kNotifyPeriodMs, nullptr);
     UpdateStatusBar();
     Layout();
@@ -1701,6 +1734,8 @@ void MainWindow::SyncPauseButton() {
 }
 
 void MainWindow::SyncProtectionState() {
+    cryptoMonitor_.SetEnabled(g_app.cfg.settings.cryptoProtection &&
+                              !g_app.paused && !exitRequested_);
     SyncPauseButton();
     SyncMenuState();
     for (size_t i = 0; i < commandButtons_.size(); ++i) {
@@ -1801,6 +1836,28 @@ void MainWindow::CompleteConfirmation(DWORD requestId, bool allow,
     confirmations_.erase(found);
 }
 
+void MainWindow::PollCryptoChanges() {
+    const bool enabled = g_app.cfg.settings.cryptoProtection &&
+                         !g_app.paused && !exitRequested_;
+    cryptoMonitor_.SetEnabled(enabled);
+    CryptoClipboardChange change;
+    while (enabled && cryptoMonitor_.PopChange(change)) RecordCryptoChange(change);
+}
+
+void MainWindow::RecordCryptoChange(const CryptoClipboardChange& change) {
+    LogRow row;
+    row.pid = GetCurrentProcessId();
+    row.process = L"ClipboardProtector.exe";
+    row.time = change.time;
+    row.clipboardSequence = change.sequence;
+    row.op = kOpWrite;
+    row.fmt = CF_UNICODETEXT;
+    row.cryptoContent = true;
+    row.cryptoChanged = true;
+    row.showNotification = true;
+    OnEvent(std::move(row));
+}
+
 void MainWindow::OnEvent(LogRow row) {
     if (row.gap) {
         row.id = nextId_++;
@@ -1848,6 +1905,7 @@ void MainWindow::OnEvent(LogRow row) {
             notificationRow.process = row.process;
             notificationRow.op = row.op;
             notificationRow.blocked = row.blocked;
+            notificationRow.cryptoChanged = row.cryptoChanged;
             notificationRow.sourcePid = row.sourcePid;
             notificationRow.sourceProcess = row.sourceProcess;
             notificationRow.ruleName = row.ruleName;
@@ -1960,12 +2018,13 @@ void MainWindow::InsertListRow(const LogRow& stored, int index) {
         stored.gap ? L"" : stored.sourceProcess.empty() ? UiText(TextId::Unknown)
                                                         : stored.sourceProcess,
         stored.sourcePid ? std::to_wstring(stored.sourcePid) : L"",
-        stored.gap ? UiText(TextId::MissingEvents) : OpName(stored.op),
-        stored.gap ? L"" : FormatName(stored.fmt), DisplayRuleName(stored.ruleName, stored.builtinRule),
-        stored.gap ? L"" : DecisionName(stored.action),
+        stored.gap ? UiText(TextId::MissingEvents) : OpName(stored.op, stored.cryptoChanged),
+        stored.gap ? L"" : FormatName(stored.fmt), LogRuleName(stored),
+        stored.gap ? L"" : DecisionName(stored.action, stored.cryptoChanged),
         stored.gap ? L"" : NotificationName(stored.showNotification),
         LogContentSummary(stored),
         stored.gap ? UiText(TextId::MissingEvents2)
+                : stored.cryptoChanged ? UiText(TextId::CryptoChanged)
                 : stored.cryptoContent
                       ? stored.blocked ? UiText(TextId::CryptoBlocked)
                                     : UiText(TextId::CryptoAllowed)
@@ -2107,11 +2166,12 @@ void MainWindow::UpdateStatusBar() {
                                        : UiText(TextId::ShortcutOnlyAwaitingInjection);
     }
     if (!g_app.paused && g_app.cfg.settings.cryptoProtection) {
-        protectionDetail_ += IsGlobalInjectionEnabled()
+        protectionDetail_ += !cryptoMonitorAvailable_ ? UiText(TextId::CryptoMonitorUnavailable)
+                            : IsGlobalInjectionEnabled()
                                  ? UiText(TextId::CryptoAddressProtection)
                                  : IsTargetedInjectionMode()
                                        ? UiText(TextId::CryptoForTargetOnly)
-                                       : UiText(TextId::CryptoAwaitingInjection);
+                                       : UiText(TextId::CryptoChangeMonitoring);
     }
 
     InvalidateRect(hwnd_, nullptr, FALSE);
@@ -2266,13 +2326,14 @@ void MainWindow::ExportCsv() {
             const std::wstring fields[18] = {
                 FormatTime(r.time), r.process, r.path, pid,
                 r.sourceProcess, r.sourcePath, sourcePid, sequence,
-                r.gap ? UiText(TextId::MissingEvents) : OpName(r.op),
-                r.gap ? L"" : FormatName(r.fmt), DisplayRuleName(r.ruleName, r.builtinRule),
-                r.gap ? L"" : DecisionName(r.action),
+                r.gap ? UiText(TextId::MissingEvents) : OpName(r.op, r.cryptoChanged),
+                r.gap ? L"" : FormatName(r.fmt), LogRuleName(r),
+                r.gap ? L"" : DecisionName(r.action, r.cryptoChanged),
                 r.gap ? L"" : NotificationName(r.showNotification),
                 r.gap ? L"" : r.hideFromLogList ? UiText(TextId::Hidden) : UiText(TextId::Visible),
                 LogContentSummary(r),
-                r.gap ? UiText(TextId::MonitoringGap) : r.blocked ? UiText(TextId::Blocked3) : UiText(TextId::Allowed2),
+                r.gap ? UiText(TextId::MonitoringGap) : r.cryptoChanged ? UiText(TextId::CryptoChanged)
+                    : r.blocked ? UiText(TextId::Blocked3) : UiText(TextId::Allowed2),
                 missing, r.gap ? L"" : count,
             };
             for (size_t i = 0; ok && i < _countof(fields); ++i) {
@@ -2324,14 +2385,16 @@ void MainWindow::ShowDetails(int index) {
         UiText(TextId::ClipboardSequence2) +
             (r.clipboardSequence ? std::to_wstring(r.clipboardSequence)
                                  : UiText(TextId::Unknown2)) +
-        UiText(TextId::Operation2) + OpName(r.op) +
+        UiText(TextId::Operation2) + OpName(r.op, r.cryptoChanged) +
         UiText(TextId::Format4) + FormatName(r.fmt) +
         UiText(TextId::MatchedRule2) +
-            (r.ruleName.empty() ? UiText(TextId::DefaultAllowSilent) : DisplayRuleName(r.ruleName, r.builtinRule)) +
-        UiText(TextId::Decision2) + DecisionName(r.action) +
+            (r.cryptoChanged ? LogRuleName(r)
+                : r.ruleName.empty() ? UiText(TextId::DefaultAllowSilent) : LogRuleName(r)) +
+        UiText(TextId::Decision2) + DecisionName(r.action, r.cryptoChanged) +
         UiText(TextId::Notification2) + NotificationName(r.showNotification) +
         UiText(TextId::ListVisibility2) + (r.hideFromLogList ? UiText(TextId::Hidden) : UiText(TextId::Visible)) +
-        UiText(TextId::Result) + (r.blocked ? UiText(TextId::Blocked3) : UiText(TextId::Allow)) +
+        UiText(TextId::Result) + (r.cryptoChanged ? UiText(TextId::CryptoChanged)
+            : r.blocked ? UiText(TextId::Blocked3) : UiText(TextId::Allow)) +
         (r.cryptoContent ? UiText(TextId::SecurityFlagCryptoContent) : L"") +
         UiText(TextId::Count2) + std::to_wstring(r.count) +
         (content.empty() ? L"" : UiText(TextId::Content2) + content);
@@ -2407,7 +2470,7 @@ void MainWindow::AddRuleFromLog(int index) {
 
     try {
         std::vector<Rule> updated = g_app.cfg.rules;
-        updated.push_back(std::move(rule));
+        updated.insert(updated.begin(), std::move(rule));
         if (!IsRuleSetSupported(updated)) {
             UiMessageBox(hwnd_, UiText(TextId::TheRuleCountFieldLengthOrTotal),
                         UiText(TextId::CouldNotAddRule), MB_ICONWARNING);
@@ -2488,11 +2551,12 @@ void MainWindow::ShowContextMenu(int x, int y) {
         status += IsGlobalInjectionEnabled() ? UiText(TextId::ShortcutOnly2)
                                              : UiText(TextId::ShortcutOnlyAccessAppliesToInjectedProcesses);
     if (!g_app.paused && g_app.cfg.settings.cryptoProtection)
-        status += IsGlobalInjectionEnabled()
+        status += !cryptoMonitorAvailable_ ? UiText(TextId::CryptoMonitorUnavailable)
+                  : IsGlobalInjectionEnabled()
                       ? UiText(TextId::CryptoAddressProtection)
                       : IsTargetedInjectionMode()
                             ? UiText(TextId::CryptoForTargetOnly)
-                            : UiText(TextId::CryptoAwaitingInjection);
+                            : UiText(TextId::CryptoChangeMonitoring);
 
     AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, status.c_str());
     AppendMenuW(menu, MF_STRING, kCmdShow, UiText(TextId::OpenMainWindow));
@@ -2633,6 +2697,7 @@ void MainWindow::BeginExit() {
     if (exitRequested_) return;
     UnregisterHotkeys();
     privateClipboard_.Clear();
+    cryptoMonitor_.SetEnabled(false);
     exitRequested_ = true;
     SyncProtectionState();
     // Queue teardown after an in-flight switch; never wait for I/O in a UI

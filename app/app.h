@@ -37,6 +37,7 @@ struct LogRow {
     BuiltinRule builtinRule = BuiltinRule::None;
     PreviewKind previewKind = PreviewKind::Text;
     bool cryptoContent = false;       // Crypto protection recognized this content
+    bool cryptoChanged = false;       // Observed after a change, not an access decision
     BYTE snapshotKind = 0;       // ClipboardSnapshotKind
     DWORD snapshotOriginalBytes = 0;
     std::vector<BYTE> snapshot;  // bounded image/file data, memory only

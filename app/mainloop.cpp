@@ -592,9 +592,16 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     }
     g_app.cfgPath = configDir + L"\\config.json";
     if (GetFileAttributesW(g_app.cfgPath.c_str()) == INVALID_FILE_ATTRIBUTES &&
-        GetLastError() == ERROR_FILE_NOT_FOUND)
-        g_app.cfg.settings.language = SystemLanguage();
-    g_app.cfg.Load(g_app.cfgPath);
+        GetLastError() == ERROR_FILE_NOT_FOUND) {
+        g_app.cfg = MakeFirstRunConfig(SystemLanguage());
+        if (!g_app.cfg.Save(g_app.cfgPath)) {
+            UiMessageBox(nullptr, UiText(TextId::CouldNotSaveInitialConfiguration),
+                         UiText(TextId::ClipboardProtector), MB_ICONERROR);
+            return 1;
+        }
+    } else {
+        g_app.cfg.Load(g_app.cfgPath);
+    }
     SetLanguage(g_app.cfg.settings.language);
     if (!CreateMainWindow()) return 1;
     RunMessageLoop();

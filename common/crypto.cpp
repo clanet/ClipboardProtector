@@ -468,6 +468,17 @@ bool HasCryptoAddressReplacement(const std::vector<CryptoAddress>& before,
     return retained < before.size() && retained < after.size();
 }
 
+bool CryptoAddressTracker::Update(const std::wstring& text) {
+    std::vector<CryptoAddress> next;
+    if (!ExtractCryptoAddresses(text, next)) return false;
+    std::sort(next.begin(), next.end(), [](const CryptoAddress& a, const CryptoAddress& b) {
+        return a.kind != b.kind ? a.kind < b.kind : a.canonical < b.canonical;
+    });
+    const bool changed = !addresses_.empty() && addresses_ != next;
+    addresses_ = std::move(next);
+    return changed;
+}
+
 bool IsPrivateKeyOrMnemonicContent(const std::wstring& text) {
     std::wstring value;
     if (!TrimText(text, 2048, value)) return false;
