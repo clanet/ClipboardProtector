@@ -1,0 +1,221 @@
+// 由 CMake configure_file 生成 app.rc，勿直接改本文件
+#pragma code_page(65001)
+#include <winres.h>
+#include "resource.h"
+
+// 嵌入清单（管理员要求 / DPI / 视觉样式）
+1 24 "@MANIFEST_ABS@"
+IDI_APP_ICON ICON "@APP_ICON_ABS@"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+ PRODUCTVERSION @PROJECT_VERSION_MAJOR@,@PROJECT_VERSION_MINOR@,@PROJECT_VERSION_PATCH@,0
+ FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+ FILEFLAGS @CLIP_FILE_FLAGS@
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "ClipboardProtector\0"
+            VALUE "FileVersion", "@CLIP_VERSION@\0"
+            VALUE "ProductName", "ClipboardProtector\0"
+            VALUE "ProductVersion", "@CLIP_VERSION@\0"
+            VALUE "OriginalFilename", "ClipboardProtector.exe\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// 对话框：设置
+IDD_PRIVATE_HOTKEYS DIALOGEX 0, 0, 330, 211
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "设置快捷键"
+FONT 9, "Segoe UI", 400, 0, 0x0
+BEGIN
+    LTEXT "全局快捷键", IDC_LABEL_600, 12, 12, 302, 12
+    LTEXT "复制选中文字：", IDC_LABEL_601, 12, 39, 90, 12
+    CONTROL "", IDC_HOTKEY_PRIVATE_COPY, "msctls_hotkey32", WS_TABSTOP | WS_BORDER, 110, 35, 206, 18
+    LTEXT "粘贴内存文字：", IDC_LABEL_602, 12, 67, 90, 12
+    CONTROL "", IDC_HOTKEY_PRIVATE_PASTE, "msctls_hotkey32", WS_TABSTOP | WS_BORDER, 110, 63, 206, 18
+    LTEXT "切换仅允许复制 /\n粘贴快捷键：", IDC_LABEL_603, 12, 95, 96, 26
+    CONTROL "", IDC_HOTKEY_SHORTCUT_ONLY, "msctls_hotkey32", WS_TABSTOP | WS_BORDER, 110, 100, 206, 18
+    LTEXT "点击输入框后按组合键；需包含 Ctrl 或 Alt，可搭配 Shift。", IDC_LABEL_604, 12, 128, 306, 20
+    LTEXT "私有复制和粘贴要求目标进程已注入新版保护模块。仅支持文字，内容不进入系统剪贴板；退出即清空。", IDC_LABEL_605, 12, 151, 306, 24
+    DEFPUSHBUTTON "确定", IDOK, 208, 186, 50, 16, WS_TABSTOP
+    PUSHBUTTON "取消", IDCANCEL, 266, 186, 50, 16, WS_TABSTOP
+END
+
+IDD_SETTINGS DIALOGEX 0, 0, 460, 300
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "设置"
+FONT 9, "Segoe UI", 400, 0, 0x0
+BEGIN
+    GROUPBOX        "规则通知总开关", IDC_LABEL_606, 8, 4, 444, 38
+    CONTROL         "关闭所有规则右下角通知", IDC_CHK_DISABLE_BALLOON,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 16, 422, 10
+    LTEXT           "不影响“每次询问”的确认窗口。",
+                    IDC_LABEL_607, 16, 28, 422, 10
+
+    GROUPBOX        "剪贴板保护", IDC_LABEL_608, 8, 46, 444, 100
+    CONTROL         "仅允许 Ctrl+C / Ctrl+Insert 与 Ctrl+V / Shift+Insert 访问剪贴板", IDC_CHK_SHORTCUT_ONLY,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 58, 422, 10
+    LTEXT           "", IDC_SHORTCUT_ONLY_HINT, 16, 71, 422, 10
+    CONTROL         "开启 Crypto 地址保护（BTC / ETH / SOL）",
+                    IDC_CHK_CRYPTO_PROTECTION, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 16, 86, 422, 10
+    LTEXT           "阻止纯地址或段落中的地址被换成其他地址，普通内容复写不拦截。需先开启保护；Ctrl+C / Ctrl+Insert 视为用户复制。",
+                    IDC_LABEL_609, 16, 99, 422, 10
+    CONTROL         "复制 / 粘贴快捷键操作直接放行",
+                    IDC_CHK_SHORTCUT_DIRECT_ALLOW, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 16, 114, 422, 10
+    LTEXT           "Ctrl+C / Ctrl+Insert 只放行写入；Ctrl+V / Shift+Insert 只放行按键后 1 秒内的读取。时限可在配置文件中调整。",
+                    IDC_LABEL_610, 16, 127, 422, 10
+
+    GROUPBOX        "日志与数据", IDC_LABEL_611, 8, 150, 218, 118
+    LTEXT           "日志最大条数：", IDC_LABEL_612, 16, 164, 60, 10
+    EDITTEXT        IDC_EDIT_MAXLOG, 78, 161, 58, 14, ES_AUTOHSCROLL | ES_NUMBER | WS_GROUP | WS_TABSTOP
+    CONTROL         "记录中显示内容预览（前 64 字符）", IDC_CHK_PREVIEW,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 183, 200, 10
+    CONTROL         "保存图片和文件列表快照（默认关闭）", IDC_CHK_CAPTURE_SNAPSHOTS,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 201, 200, 10
+    LTEXT           "用于日志右键复制；可能保存图片和完整本地文件路径。",
+                    IDC_LABEL_613, 16, 214, 200, 10
+    CONTROL         "忽略自定义格式（默认开启）", IDC_CHK_IGNORE_CUSTOM_FORMATS,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 230, 200, 10
+    LTEXT           "注册格式如 格式#49899 不记录、不走规则；文本、图片和文件仍处理。",
+                    IDC_LABEL_614, 16, 243, 200, 18
+
+    GROUPBOX        "启动行为", IDC_LABEL_615, 234, 150, 218, 118
+    CONTROL         "随 Windows 开机自动启动（计划任务，最高权限）", IDC_CHK_AUTOSTART,
+                    "Button", BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP, 242, 164, 200, 18
+    CONTROL         "打开后自动保护", IDC_CHK_START_GLOBAL,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 242, 194, 200, 12
+    LTEXT           "下次打开程序时自动开启保护。", IDC_LABEL_616, 242, 210, 200, 10
+    CONTROL         "启动程序时最小化到托盘", IDC_CHK_START_MINIMIZED,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 242, 224, 200, 12
+
+    DEFPUSHBUTTON   "确定", IDOK, 350, 278, 48, 15, WS_TABSTOP
+    PUSHBUTTON      "取消", IDCANCEL, 404, 278, 48, 15, WS_TABSTOP
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// 对话框：访问规则
+IDD_RULES DIALOGEX 0, 0, 560, 242
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "剪贴板访问规则"
+FONT 9, "Segoe UI", 400, 0, 0x0
+BEGIN
+    LTEXT           "规则按列表顺序匹配，第一条命中后停止。可将可信例外放在阻止规则上方。",
+                    IDC_LABEL_617, 8, 7, 470, 11
+    CONTROL         "", IDC_LIST_RULES, "SysListView32",
+                    LVS_REPORT | LVS_SHOWSELALWAYS | WS_CHILD | WS_VISIBLE |
+                    WS_BORDER | WS_TABSTOP, 8, 21, 470, 192
+    PUSHBUTTON      "添加规则(&A)", IDC_BTN_ADD, 486, 21, 66, 16, WS_TABSTOP
+    PUSHBUTTON      "编辑规则(&E)", IDC_BTN_EDIT, 486, 42, 66, 16, WS_TABSTOP
+    PUSHBUTTON      "删除规则(&D)", IDC_BTN_DEL, 486, 63, 66, 16, WS_TABSTOP
+    PUSHBUTTON      "上移(&U)", IDC_BTN_UP, 486, 91, 66, 16, WS_TABSTOP
+    PUSHBUTTON      "下移(&N)", IDC_BTN_DOWN, 486, 112, 66, 16, WS_TABSTOP
+    LTEXT           "提示：双击规则可直接编辑。", IDC_LABEL_618, 486, 142, 66, 27
+    DEFPUSHBUTTON   "保存规则", IDOK, 436, 220, 56, 16, WS_TABSTOP
+    PUSHBUTTON      "取消", IDCANCEL, 496, 220, 56, 16, WS_TABSTOP
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// 对话框：编辑单条规则
+IDD_RULE_EDIT DIALOGEX 0, 0, 430, 326
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "编辑规则"
+FONT 9, "Segoe UI", 400, 0, 0x0
+BEGIN
+    CONTROL         "启用这条规则", IDC_CHK_RULE_ENABLED, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 12, 10, 72, 12
+    LTEXT           "规则名称：", IDC_LABEL_619, 100, 11, 46, 10
+    EDITTEXT        IDC_ED_RULE_NAME, 148, 8, 270, 14,
+                    ES_AUTOHSCROLL | WS_TABSTOP
+
+    GROUPBOX        "本次访问进程", IDC_LABEL_620, 8, 29, 414, 55
+    LTEXT           "匹配方式：", IDC_LABEL_621, 18, 45, 42, 10
+    COMBOBOX        IDC_CMB_TYPE, 62, 42, 102, 70,
+                    CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "进程名或路径：", IDC_LABEL_622, 176, 45, 60, 10
+    EDITTEXT        IDC_ED_PATTERN, 238, 42, 174, 14,
+                    ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "支持通配符 * 和 ?；填写 * 表示所有访问进程。",
+                    IDC_LABEL_623, 18, 64, 330, 10
+
+    GROUPBOX        "剪贴板内容来源", IDC_LABEL_624, 8, 89, 414, 55
+    LTEXT           "来源条件：", IDC_LABEL_625, 18, 105, 42, 10
+    COMBOBOX        IDC_CMB_SOURCE_MODE, 62, 102, 132, 100,
+                    CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "来源进程：", IDC_LABEL_626, 206, 105, 46, 10
+    EDITTEXT        IDC_ED_SOURCE_PATTERN, 254, 102, 158, 14,
+                    ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "来源未知时只命中“任意来源”或“来源未知”规则。",
+                    IDC_LABEL_627, 18, 124, 340, 10
+
+    GROUPBOX        "访问内容", IDC_LABEL_628, 8, 149, 414, 96
+    LTEXT           "操作：", IDC_LABEL_629, 18, 166, 28, 10
+    COMBOBOX        IDC_CMB_OPERATION, 48, 163, 88, 70,
+                    CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "格式：", IDC_LABEL_630, 152, 166, 28, 10
+    COMBOBOX        IDC_CMB_FORMAT, 182, 163, 112, 90,
+                    CBS_DROPDOWNLIST | WS_TABSTOP
+    CONTROL         "忽略大小写", IDC_CHK_REGEX_IGNORECASE, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 316, 165, 82, 11
+    LTEXT           "内容正则：", IDC_LABEL_631, 18, 185, 44, 10
+    EDITTEXT        IDC_ED_CONTENT_REGEX, 64, 182, 348, 14,
+                    ES_AUTOHSCROLL | WS_TABSTOP
+    LTEXT           "测试内容：", IDC_LABEL_632, 18, 205, 44, 10
+    EDITTEXT        IDC_ED_REGEX_SAMPLE, 64, 202, 235, 14,
+                    ES_AUTOHSCROLL | WS_TABSTOP
+    PUSHBUTTON      "测试匹配", IDC_BTN_TEST_REGEX, 306, 201, 54, 16, WS_TABSTOP
+    LTEXT           "尚未测试", IDC_LBL_REGEX_RESULT, 366, 204, 46, 10
+    LTEXT           "文本包含 ASCII/ANSI、OEM、Unicode 与 UTF-8；地址和私钥助记词会校验完整内容。",
+                    IDC_LABEL_633, 18, 224, 380, 10
+
+    GROUPBOX        "处理结果与通知", IDC_LABEL_634, 8, 250, 414, 48
+    LTEXT           "处理方式：", IDC_LABEL_635, 18, 264, 42, 10
+    COMBOBOX        IDC_CMB_ACTION, 62, 261, 92, 70,
+                    CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "结果通知：", IDC_LABEL_636, 170, 264, 42, 10
+    COMBOBOX        IDC_CMB_NOTIFICATION, 214, 261, 104, 50,
+                    CBS_DROPDOWNLIST | WS_TABSTOP
+    CONTROL         "不显示日志", IDC_CHK_HIDE_FROM_LOG_LIST, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 330, 263, 82, 11
+    LTEXT           "确认超时：", IDC_LABEL_637, 18, 281, 45, 10
+    EDITTEXT        IDC_ED_CONFIRM_TIMEOUT, 65, 278, 34, 14,
+                    ES_AUTOHSCROLL | ES_NUMBER | WS_TABSTOP
+    LTEXT           "秒，超时后", IDC_LABEL_638, 102, 281, 47, 10
+    COMBOBOX        IDC_CMB_TIMEOUT_ACTION, 151, 278, 112, 60,
+                    CBS_DROPDOWNLIST | WS_TABSTOP
+
+    DEFPUSHBUTTON   "保存", IDOK, 310, 305, 50, 16, WS_TABSTOP
+    PUSHBUTTON      "取消", IDCANCEL, 366, 305, 50, 16, WS_TABSTOP
+END
+
+/////////////////////////////////////////////////////////////////////////////
+// 对话框：单进程保护
+IDD_TARGET_PROCESS DIALOGEX 0, 0, 310, 140
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "单进程保护"
+FONT 9, "Segoe UI", 400, 0, 0x0
+BEGIN
+    LTEXT           "目标 PID：", IDC_LABEL_639, 12, 12, 44, 10
+    EDITTEXT        IDC_EDIT_TARGET_PID, 58, 9, 82, 14,
+                    ES_AUTOHSCROLL | ES_NUMBER | WS_GROUP | WS_TABSTOP
+    LTEXT           "可选择任意同架构的桌面 GUI 进程；设置只在当前会话生效。",
+                    IDC_LABEL_640, 12, 30, 286, 20
+    GROUPBOX        "目标检查", IDC_LABEL_641, 8, 54, 294, 52
+    LTEXT           "请输入要保护的目标进程 ID。", IDC_TARGET_PROCESS_INFO,
+                    16, 67, 278, 32
+    DEFPUSHBUTTON   "开始测试", IDOK, 196, 116, 50, 15, WS_TABSTOP
+    PUSHBUTTON      "取消", IDCANCEL, 252, 116, 50, 15, WS_TABSTOP
+END

@@ -1,0 +1,27 @@
+build/
+build-*/
+.shots/
+sandbox-results/
+*.user
+*.aps
+dist/
+.vs/
+CMakeUserPresets.json
+# Local configuration, exports, credentials, and crash data.
+config.json
+config.json.tmp
+config.json.bak*
+*.csv
+*.log
+*.dmp
+*.pdb
+*.exe
+*.dll
+*.pfx
+*.p12
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+gitleaks*.json

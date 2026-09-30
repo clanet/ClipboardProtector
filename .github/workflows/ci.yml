@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      extended_tests:
+        description: Run additional desktop tests on this disposable GitHub-hosted runner
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [Win32, x64]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Configure
+        run: cmake -S . -B build/ci/${{ matrix.arch }} -G "Visual Studio 17 2022" -A ${{ matrix.arch }} -DBUILD_TESTING=ON -DCLIP_NO_ELEVATE=ON
+      - name: Build
+        run: cmake --build build/ci/${{ matrix.arch }} --config Release --parallel
+      - name: Core smoke tests
+        run: ctest --test-dir build/ci/${{ matrix.arch }} -C Release -R '^(common_smoke|hook_smoke|injection_smoke|language_smoke)$' --output-on-failure
+      - name: Extended desktop tests (opt-in)
+        if: github.event_name == 'workflow_dispatch' && inputs.extended_tests
+        run: ctest --test-dir build/ci/${{ matrix.arch }} -C Release -E '^(common_smoke|hook_smoke|injection_smoke|language_smoke)$' --output-on-failure
+      - name: Preserve test logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: test-logs-${{ matrix.arch }}
+          path: build/ci/${{ matrix.arch }}/Testing/Temporary/
+          if-no-files-found: ignore
+          retention-days: 7
