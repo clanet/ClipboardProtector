@@ -29,6 +29,28 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
 endif()
 
 if(BUILD_TESTING)
+  add_executable(shutdownlifecyclesmoke shutdownlifecyclesmoke.cpp ../app/pipeserver.cpp ../common/winutil.cpp)
+  target_include_directories(shutdownlifecyclesmoke PRIVATE ../app)
+  target_compile_definitions(shutdownlifecyclesmoke PRIVATE CLIP_TEST_OBJECT_NAMES CLIP_TEST_RELAXED_IPC_SECURITY)
+  target_link_libraries(shutdownlifecyclesmoke PRIVATE clip_common user32)
+  foreach(mode detached retained disconnected)
+    add_test(NAME shutdown_${mode}_smoke COMMAND shutdownlifecyclesmoke "$<TARGET_FILE:HookDll>" ${mode})
+    set_tests_properties(shutdown_${mode}_smoke PROPERTIES TIMEOUT 20 RUN_SERIAL TRUE)
+  endforeach()
+  add_executable(shutdowntracesmoke shutdowntracesmoke.cpp)
+  target_link_libraries(shutdowntracesmoke PRIVATE clip_common)
+  add_test(NAME shutdown_trace_smoke COMMAND shutdowntracesmoke
+    "${CMAKE_CURRENT_BINARY_DIR}/shutdown-trace-smoke/$<CONFIG>")
+  set_tests_properties(shutdown_trace_smoke PROPERTIES TIMEOUT 20)
+  set(DETOURS_TEST_SRC "${CMAKE_SOURCE_DIR}/third_party/Detours/src")
+  add_executable(detourheapsmoke detourheapsmoke.cpp
+    ${DETOURS_TEST_SRC}/detours.cpp ${DETOURS_TEST_SRC}/disasm.cpp
+    ${DETOURS_TEST_SRC}/modules.cpp ${DETOURS_TEST_SRC}/image.cpp
+    ${DETOURS_TEST_SRC}/creatwth.cpp)
+  target_include_directories(detourheapsmoke PRIVATE ${DETOURS_TEST_SRC})
+  target_compile_definitions(detourheapsmoke PRIVATE CLIP_DETOURS_STATIC_NODES)
+  add_test(NAME detour_heap_smoke COMMAND detourheapsmoke)
+  set_tests_properties(detour_heap_smoke PROPERTIES TIMEOUT 15)
   add_executable(cryptomonitorsmoke cryptomonitorsmoke.cpp ../app/cryptomonitor.cpp)
   target_link_libraries(cryptomonitorsmoke PRIVATE clip_common user32)
   add_test(NAME crypto_monitor_smoke COMMAND cryptomonitorsmoke)
@@ -43,7 +65,15 @@ if(BUILD_TESTING)
   add_executable(clipclient clipclient.cpp)
   add_executable(hooksmoke hooksmoke.cpp)
   add_test(NAME hook_smoke COMMAND hooksmoke "$<TARGET_FILE:HookDll>")
+  add_test(NAME hook_abort_smoke COMMAND hooksmoke --freeze-abort "$<TARGET_FILE:HookDll>")
+  set_tests_properties(hook_abort_smoke PROPERTIES TIMEOUT 15)
   set_tests_properties(hook_smoke PROPERTIES TIMEOUT 15)
+  add_test(NAME hook_owner_smoke COMMAND ${CMAKE_COMMAND}
+    "-DPROBE_EXE=$<TARGET_FILE:hooksmoke>"
+    "-DHOOK_DLL=$<TARGET_FILE:HookDll>"
+    "-DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/hook-owner-smoke/$<CONFIG>"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/hook-owner-smoke.cmake")
+  set_tests_properties(hook_owner_smoke PROPERTIES TIMEOUT 30)
 
     add_executable(commonsmoke commonsmoke.cpp)
     add_executable(privateclipboardsmoke privateclipboardsmoke.cpp ../app/privateclipboard.cpp)
@@ -59,7 +89,14 @@ if(BUILD_TESTING)
   # Includes queue stress, repeated detach/restart, and optional clipboard transactions.
   set_tests_properties(injection_smoke PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 
-  add_executable(injectorsmoke injectorsmoke.cpp ../app/injector.cpp)
+  add_executable(hookthreadsmoke hookthreadsmoke.cpp ../app/hookthread.cpp)
+  target_include_directories(hookthreadsmoke PRIVATE ../app)
+  target_compile_definitions(hookthreadsmoke PRIVATE CLIP_TEST_HOOK_THREAD)
+  target_link_libraries(hookthreadsmoke PRIVATE clip_common user32)
+  add_test(NAME hook_thread_smoke COMMAND hookthreadsmoke)
+  set_tests_properties(hook_thread_smoke PROPERTIES TIMEOUT 15)
+
+  add_executable(injectorsmoke injectorsmoke.cpp ../app/injector.cpp ../app/hookthread.cpp)
   target_include_directories(injectorsmoke PRIVATE ../app)
   target_link_libraries(injectorsmoke PRIVATE clip_common)
   add_test(NAME injector_smoke

@@ -10,6 +10,7 @@
 #include "ipc.h"
 #include "rules.h"
 #include "winutil.h"
+#include "shutdowntrace.h"
 #include <shellapi.h>
 #include <aclapi.h>
 #include <atomic>
@@ -107,7 +108,7 @@ bool AllowCurrentUserProcessQuery() {
     if (result != ERROR_SUCCESS) return false;
 
     EXPLICIT_ACCESSW access = {};
-    access.grfAccessPermissions = PROCESS_QUERY_LIMITED_INFORMATION;
+    access.grfAccessPermissions = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
     access.grfAccessMode = GRANT_ACCESS;
     access.grfInheritance = NO_INHERITANCE;
     access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
@@ -134,15 +135,27 @@ struct HookRemovalResult {
 
 HookRemovalResult RemoveHooksAndRestartServer(bool restrictOnFailure,
                                               DWORD targetPid = 0) {
+    ShutdownTrace trace;
+    trace.Open(L"controller-switch");
+    trace.Mark("coverage.pause.begin");
     const bool coverageWasRunning = g_coverage.running();
     if (coverageWasRunning) g_coverage.Pause();
-    g_server.Stop();
-    g_pipeServerRunning = false;
+    trace.Mark("coverage.pause.end");
+    // Workers own DLL references. Remove message hooks before host threads
+    // enter Detours teardown, so the global hook chain no longer spans it.
     HookRemovalResult result;
+    trace.Mark("injector.remove.begin");
     result.removed = g_injector.Remove();
+    trace.Mark("injector.remove.end", result.removed);
+    trace.Mark("pipe_server.stop.begin");
+    g_server.Stop();
+    trace.Mark("pipe_server.stop.end");
+    g_pipeServerRunning = false;
     if (result.removed) {
+        trace.Mark("coverage.release.begin");
         g_coverage.ReleaseRetainedReferences();
         g_coverage.Clear();
+        trace.Mark("coverage.release.end");
     }
     const bool restricted = restrictOnFailure && !result.removed;
     result.serverRestarted =
@@ -158,13 +171,13 @@ void CleanupCreateFailure() {
     // Startup can fail after any of these objects has been initialized. Tear
     // them down in the same dependency order used by normal exit so no worker
     // can post into a destroyed window or execute an unloaded hook DLL.
+    g_coverage.Pause();
+    if (g_app.injector) g_injector.Remove();
     if (g_app.server) {
-        g_coverage.Pause();
         g_server.Stop();
         g_pipeServerRunning = false;
     }
     if (g_app.injector) {
-        g_injector.Remove();
         g_coverage.ReleaseRetainedReferences();
         g_coverage.Clear();
     }
@@ -506,6 +519,12 @@ bool CreateMainWindow() {
     // invalid environment target starts a reject-all server (PID 0).
     if (!g_server.Start(g_wnd.hwnd(), targetSpecified,
                         singleTarget ? targetPid : 0)) {
+        const DWORD error = GetLastError();
+        const std::wstring message =
+            std::wstring(UiText(TextId::CouldNotStartTheNamedPipeService)) +
+            L"\nWin32: " + std::to_wstring(error);
+        UiMessageBox(g_wnd.hwnd(), message.c_str(),
+                     UiText(TextId::ClipboardProtector), MB_ICONERROR);
         CleanupCreateFailure();
         return false;
     }
@@ -544,17 +563,29 @@ void RequestExit() {
 }
 
 void StopProtectionForExit() {
-    // 先让 DLL 收到 fail-open/shutdown，再移除系统 Hook 和销毁窗口。
+    ShutdownTrace trace;
+    trace.Open(L"controller-exit");
+    trace.Mark("coverage.pause.begin");
     g_coverage.Pause();
+    trace.Mark("coverage.pause.end");
+    if (g_app.injector) {
+        trace.Mark("injector.remove.begin");
+        const bool removed = g_app.injector->Remove();
+        trace.Mark("injector.remove.end", removed);
+    }
     if (g_app.server) {
+        trace.Mark("pipe_server.stop.begin");
         g_app.server->Stop();
+        trace.Mark("pipe_server.stop.end");
         g_pipeServerRunning = false;
     }
     if (g_app.injector) {
-        g_app.injector->Remove();
+        trace.Mark("coverage.release.begin");
         g_coverage.ReleaseRetainedReferences();
         g_coverage.Clear();
+        trace.Mark("coverage.release.end");
     }
+    trace.Mark("controller.shutdown.end");
 }
 
 } // namespace clip

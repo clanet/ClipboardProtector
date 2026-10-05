@@ -7,6 +7,7 @@ add_library(clip_common STATIC
   util.cpp
   winutil.cpp
   remotehook.cpp
+  shutdowntrace.cpp
 )
 target_include_directories(clip_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(clip_common PUBLIC bcrypt advapi32)

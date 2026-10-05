@@ -1,4 +1,5 @@
 #pragma once
+#include "hookthread.h"
 #include <windows.h>
 #include <string>
 
@@ -20,7 +21,7 @@ public:
                             const std::wstring& hookDllPath);
 #endif
     bool Remove();
-    bool installed() const { return hook_ != nullptr; }
+    bool installed() const { return hook_.installed(); }
     DWORD lastError() const { return lastError_; }
     const std::wstring& lastErrorText() const { return lastErrorText_; }
 
@@ -29,7 +30,7 @@ private:
                               HANDLE targetProcess, HANDLE targetThread,
                               const std::wstring& expectedTargetPath);
     HMODULE mod_ = nullptr;
-    HHOOK hook_ = nullptr;
+    HookThread hook_;
     DWORD lastError_ = ERROR_SUCCESS;
     std::wstring lastErrorText_;
 #ifdef _WIN64

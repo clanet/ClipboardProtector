@@ -42,11 +42,27 @@ cmake --build build/dev/x64 --config Release --parallel
 ## 基础回归
 
 ```powershell
-ctest --test-dir build/dev/x86 -C Release -R '^(common_smoke|hook_smoke|injection_smoke)$' --output-on-failure
-ctest --test-dir build/dev/x64 -C Release -R '^(common_smoke|hook_smoke|injection_smoke)$' --output-on-failure
+ctest --test-dir build/dev/x86 -C Release -R '^(common_smoke|shutdown_detached_smoke|shutdown_retained_smoke|shutdown_disconnected_smoke|remote_unload_smoke|shutdown_trace_smoke|hook_smoke|hook_abort_smoke|detour_heap_smoke|hook_owner_smoke|hook_thread_smoke|injection_smoke)$' --output-on-failure
+ctest --test-dir build/dev/x64 -C Release -R '^(common_smoke|shutdown_detached_smoke|shutdown_retained_smoke|shutdown_disconnected_smoke|remote_unload_smoke|shutdown_trace_smoke|hook_smoke|hook_abort_smoke|detour_heap_smoke|hook_owner_smoke|hook_thread_smoke|injection_smoke)$' --output-on-failure
 ```
 
 `injection_smoke` 只向自己创建的子进程注入。完整复制事务子用例使用私有窗口站；如果系统拒绝创建，输出 `crypto-transactions-skipped=private-window-station-unavailable`，其余无 `OpenClipboard` 的用例仍执行。CTest 的整体通过不代表该子用例已执行。
+
+`hook_smoke` 在测试进程内覆盖动态线程下的安装/卸钩、忙碌调用期间及时解除 Detours 并保留引用、调用返回后的清理、再次开启与空闲卸载。通过测试专用计数核对每次关闭只进入一次 Detours 暂停阶段；不在事务结束后重新挂起宿主。剪贴板 API 调用故意省略 `OpenClipboard`，不读取或修改系统剪贴板内容。
+
+`detour_heap_smoke` 仅暂停自己创建的测试线程，令该线程持有进程堆锁，验证 Detours 安装和拆除不依赖宿主堆。`hook_abort_smoke` 分别在首次挂起和首次 Detours 线程登记后强制中止事务，检查两层暂停计数都能恢复，调用线程能继续并退出。`hook_smoke` 还输出暂停区间的实际微秒数；这属于单进程测量，不代表全桌面延迟。
+
+`shutdown_trace_smoke` 验证日志在关闭前可读、计时与错误码、宿主堆被其他线程锁住时仍能记录、容量上限、禁用及目录不可写时的安全退化。它只启动自己的测试子进程，验证子进程停在等待阶段时另一进程能读取最后记录，以及未执行日志析构直接退出后的记录可读性。测试日志放在构建目录，不执行注入或访问剪贴板。实际诊断文件的位置与字段见 [退出卡顿诊断日志](manual.md#退出卡顿诊断日志)。
+
+`shutdown_detached_smoke`、`shutdown_retained_smoke` 和 `shutdown_disconnected_smoke` 使用独立测试进程，验证新控制端身份绑定、旧一代通信对象仍存在时启动、成功拆钩、强制回滚后的安全保留、对应关闭确认和客户端断开。测试核对管道日志中的终态，要求退出不等待完整的 5 秒；保留场景还调用未打开剪贴板的 API，验证 Hook 代码仍有效。只有这个测试目标使用 `CLIP_TEST_RELAXED_IPC_SECURITY`，给随机测试进程名下的对象提供适用于受限令牌的访问权限；正式组件不定义该宏。
+
+`remote_unload_smoke` 验证维护工具拒绝 `--execute` 后，测试子进程与其 DLL 均保持存活，直到测试进程正常退出。此工具不再执行远程 `FreeLibrary`。
+
+Detours 的固定事务存储属于本地条件补丁，容量和更新注意事项见 [本地修改说明](../third_party/Detours/LOCAL_CHANGES.md)。
+
+`hook_thread_smoke` 只在测试进程内安装线程级 `WH_GETMESSAGE`。生命周期调用线程阻塞等待期间，验证独立 Hook 线程仍处理同步窗口消息、目标线程仍收到经过 Hook 的消息；另覆盖安装失败、卸载失败后的响应与重试、重复启停和析构清理。不会安装全局 Hook，也不访问剪贴板；此测试已纳入基础 CI，但不替代真实跨位数全局回调验收。
+
+`hook_owner_smoke` 在构建目录中用独立子进程验证完整路径识别：与 DLL 同目录的主程序和 `HookHost32.exe` 不得启动 Hook worker，同目录的其他程序及其他目录下的同名程序仍是普通目标。测试只加载 DLL 并检查身份与回调，不安装全局 Hook，不访问剪贴板。
 
 `crypto_monitor_smoke` 使用替代剪贴板读取器验证后台地址变化监测，覆盖不变内容去重、无序列号变化的内容修改、读取失败重试、暂停/重启基线和读取阻塞时的有界退出，不读取或修改系统剪贴板：
 
@@ -88,7 +104,7 @@ ctest --test-dir build/dev/x64 -C Release -R '^language(_ui)?_smoke$' --output-o
 
 ## GitHub Actions
 
-- `CI`：Windows Server 2022 runner，分别构建 Win32/x64，运行三项基础 smoke、语言单元回归和地址变化监测回归；通过手动运行的 `extended_tests` 可执行额外桌面测试。CI 不代表 Windows 10/11 桌面兼容性或长期稳定性验收。
+- `CI`：Windows Server 2022 runner，分别构建 Win32/x64，运行基础 smoke、卸钩与诊断日志回归、语言单元回归和地址变化监测回归；通过手动运行的 `extended_tests` 可执行额外桌面测试。CI 不代表 Windows 10/11 桌面兼容性或长期稳定性验收。
 - `Secret scan`：拉取完整 Git 历史，使用固定版本与 SHA-256 校验的 Gitleaks；不上传包含发现项的报告文件。
 - `Release package`：按 `VERSION` 编译正式 x86/x64 组件，ZIP 仅含四个运行组件和中英文 README，许可文本合并到英文 README。版本 tag 触发时校验 ZIP 并自动创建 GitHub Release，仅上传 ZIP，带后缀的版本标为预发布；手动选择 `main` 时只生成 Actions artifact。SHA-256 文件仅供流程内部核验。
 

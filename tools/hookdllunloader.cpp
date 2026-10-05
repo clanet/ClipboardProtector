@@ -23,16 +23,12 @@ struct ModuleRecord {
     DWORD size = 0;
 };
 
-struct RemoteFunction {
-    std::wstring ownerModule;
-    ULONG_PTR offset = 0;
-};
-
 void PrintUsage() {
     fwprintf(stderr,
              L"Usage: HookDllUnloader[32].exe --dll <absolute-path> "
              L"[--pid <id>] [--execute] [--include-system]\n"
-             L"Without --execute the tool only lists exact-path matches.\n");
+             L"Lists exact-path matches only. --execute is rejected because safe "
+             L"Detour removal cannot be verified.\n");
 }
 
 bool ParseProcessId(const wchar_t* text, DWORD& value) {
@@ -169,14 +165,6 @@ const ModuleRecord* FindModuleByPath(const std::vector<ModuleRecord>& modules,
     return nullptr;
 }
 
-const ModuleRecord* FindModuleByName(const std::vector<ModuleRecord>& modules,
-                                     const std::wstring& name) {
-    for (const auto& module : modules) {
-        if (_wcsicmp(module.name.c_str(), name.c_str()) == 0) return &module;
-    }
-    return nullptr;
-}
-
 bool QueryProcessPath(HANDLE process, std::wstring& path) {
     std::vector<wchar_t> buffer(32768);
     DWORD length = static_cast<DWORD>(buffer.size());
@@ -194,28 +182,6 @@ bool SameArchitecture(HANDLE process, bool& same) {
         return false;
     same = currentWow64 == targetWow64;
     return true;
-}
-
-bool EnableDebugPrivilege() {
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(),
-                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
-        return false;
-    LUID id = {};
-    if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &id)) {
-        CloseHandle(token);
-        return false;
-    }
-    TOKEN_PRIVILEGES privileges = {};
-    privileges.PrivilegeCount = 1;
-    privileges.Privileges[0].Luid = id;
-    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    SetLastError(ERROR_SUCCESS);
-    const BOOL adjusted = AdjustTokenPrivileges(token, FALSE, &privileges, 0,
-                                                nullptr, nullptr);
-    const DWORD error = GetLastError();
-    CloseHandle(token);
-    return adjusted && error != ERROR_NOT_ALL_ASSIGNED;
 }
 
 bool IsCriticalProcess(HANDLE process) {
@@ -240,140 +206,6 @@ bool IsWindowsProcess(const std::wstring& processPath) {
            _wcsnicmp(normalized.c_str(), prefix.c_str(), prefix.size()) == 0;
 }
 
-bool ControllerRunning() {
-    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snapshot == INVALID_HANDLE_VALUE) return false;
-    PROCESSENTRY32W entry = {sizeof(entry)};
-    bool found = false;
-    if (Process32FirstW(snapshot, &entry)) {
-        do {
-            if (entry.th32ProcessID != GetCurrentProcessId() &&
-                _wcsicmp(entry.szExeFile, L"ClipboardProtector.exe") == 0) {
-                found = true;
-                break;
-            }
-        } while (Process32NextW(snapshot, &entry));
-    }
-    CloseHandle(snapshot);
-    return found;
-}
-
-bool LocalModuleSize(HMODULE module, DWORD& size) {
-    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
-    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0)
-        return false;
-    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
-        reinterpret_cast<const BYTE*>(module) + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE ||
-        nt->OptionalHeader.SizeOfImage == 0)
-        return false;
-    size = nt->OptionalHeader.SizeOfImage;
-    return true;
-}
-
-bool ResolveFreeLibrary(RemoteFunction& result) {
-    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
-    FARPROC freeLibrary = kernel32 ? GetProcAddress(kernel32, "FreeLibrary")
-                                   : nullptr;
-    if (!freeLibrary) return false;
-    HMODULE owner = nullptr;
-    if (!GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(freeLibrary), &owner))
-        return false;
-    DWORD ownerSize = 0;
-    if (!LocalModuleSize(owner, ownerSize)) return false;
-    const ULONG_PTR address = reinterpret_cast<ULONG_PTR>(freeLibrary);
-    const ULONG_PTR base = reinterpret_cast<ULONG_PTR>(owner);
-    if (address < base || address - base >= ownerSize) return false;
-    wchar_t ownerPath[32768] = {};
-    const DWORD length = GetModuleFileNameW(owner, ownerPath, _countof(ownerPath));
-    if (length == 0 || length >= _countof(ownerPath)) return false;
-    result.ownerModule = BaseName(std::wstring(ownerPath, length));
-    result.offset = address - base;
-    return true;
-}
-
-bool WaitUntilModuleGone(DWORD processId, const std::wstring& dllPath,
-                         DWORD timeout) {
-    const ULONGLONG deadline = GetTickCount64() + timeout;
-    do {
-        std::vector<ModuleRecord> modules;
-        DWORD error = ERROR_SUCCESS;
-        if (SnapshotModules(processId, modules, error) &&
-            !FindModuleByPath(modules, dllPath))
-            return true;
-        Sleep(20);
-    } while (GetTickCount64() < deadline);
-    return false;
-}
-
-bool RemoteFreeLibrary(DWORD processId, const std::wstring& dllPath,
-                       const RemoteFunction& function, DWORD& error,
-                       bool& processExited) {
-    processExited = false;
-    HANDLE process = OpenProcess(
-        PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
-            PROCESS_VM_WRITE | PROCESS_VM_READ | SYNCHRONIZE,
-        FALSE, processId);
-    if (!process) {
-        error = GetLastError();
-        return false;
-    }
-    if (WaitForSingleObject(process, 0) != WAIT_TIMEOUT) {
-        processExited = true;
-        error = ERROR_PROCESS_ABORTED;
-        CloseHandle(process);
-        return false;
-    }
-
-    std::vector<ModuleRecord> modules;
-    if (!SnapshotModules(processId, modules, error)) {
-        CloseHandle(process);
-        return false;
-    }
-    const ModuleRecord* target = FindModuleByPath(modules, dllPath);
-    const ModuleRecord* owner = FindModuleByName(modules, function.ownerModule);
-    if (!target || !owner || function.offset >= owner->size) {
-        error = ERROR_MOD_NOT_FOUND;
-        CloseHandle(process);
-        return false;
-    }
-    auto remoteFunction = reinterpret_cast<LPTHREAD_START_ROUTINE>(
-        owner->base + function.offset);
-    HANDLE thread = CreateRemoteThread(process, nullptr, 0, remoteFunction,
-                                       target->base, 0, nullptr);
-    if (!thread) {
-        error = GetLastError();
-        CloseHandle(process);
-        return false;
-    }
-    const DWORD wait = WaitForSingleObject(thread, 5000);
-    DWORD threadResult = 0;
-    const bool completed =
-        wait == WAIT_OBJECT_0 && GetExitCodeThread(thread, &threadResult);
-    CloseHandle(thread);
-    if (!completed || threadResult == 0) {
-        error = wait == WAIT_TIMEOUT ? WAIT_TIMEOUT : ERROR_DLL_INIT_FAILED;
-        processExited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
-        CloseHandle(process);
-        return false;
-    }
-    processExited = WaitForSingleObject(process, 0) == WAIT_OBJECT_0;
-    CloseHandle(process);
-    if (processExited) {
-        error = ERROR_PROCESS_ABORTED;
-        return false;
-    }
-    if (!WaitUntilModuleGone(processId, dllPath, 3000)) {
-        error = ERROR_BUSY;
-        return false;
-    }
-    error = ERROR_SUCCESS;
-    return true;
-}
-
 } // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -389,21 +221,12 @@ int wmain(int argc, wchar_t** argv) {
                  options.dllPath.c_str());
         return 2;
     }
-    if (options.execute && ControllerRunning()) {
+    if (options.execute) {
         fwprintf(stderr,
-                 L"Refusing to execute while ClipboardProtector.exe is "
-                 L"running. Stop it first.\n");
+                 L"REFUSED: remote FreeLibrary is disabled. A stopped controller "
+                 L"does not prove that Detours or in-flight calls are gone. "
+                 L"Restart the target application or Windows instead.\n");
         return 3;
-    }
-    if (options.execute && !EnableDebugPrivilege()) {
-        fwprintf(stderr,
-                 L"Warning: SeDebugPrivilege is unavailable; only accessible "
-                 L"processes can be modified.\n");
-    }
-    RemoteFunction freeLibrary;
-    if (!ResolveFreeLibrary(freeLibrary)) {
-        fwprintf(stderr, L"Cannot resolve the local FreeLibrary implementation.\n");
-        return 4;
     }
 
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -412,9 +235,7 @@ int wmain(int argc, wchar_t** argv) {
         return 4;
     }
     unsigned matches = 0;
-    unsigned unloaded = 0;
     unsigned skipped = 0;
-    unsigned failed = 0;
     PROCESSENTRY32W entry = {sizeof(entry)};
     if (Process32FirstW(snapshot, &entry)) {
         do {
@@ -461,34 +282,16 @@ int wmain(int argc, wchar_t** argv) {
                 ++skipped;
                 fwprintf(stdout,
                          L"SKIP pid=%lu reason=windows-process "
-                         L"(use --include-system)\n",
+                         L"(list with --include-system)\n",
                          processId);
                 CloseHandle(process);
                 continue;
             }
             CloseHandle(process);
-            if (!options.execute) continue;
-
-            DWORD error = ERROR_SUCCESS;
-            bool processExited = false;
-            if (RemoteFreeLibrary(processId, dllPath, freeLibrary, error,
-                                  processExited)) {
-                ++unloaded;
-                fwprintf(stdout, L"UNLOADED pid=%lu\n", processId);
-            } else {
-                ++failed;
-                fwprintf(stdout,
-                         L"FAILED pid=%lu error=%lu process-exited=%d\n",
-                         processId, error, processExited ? 1 : 0);
-            }
         } while (Process32NextW(snapshot, &entry));
     }
     CloseHandle(snapshot);
 
-    fwprintf(stdout,
-             L"SUMMARY mode=%ls matches=%u unloaded=%u skipped=%u failed=%u\n",
-             options.execute ? L"execute" : L"list", matches, unloaded,
-             skipped, failed);
-    if (!options.execute) return 0;
-    return failed == 0 && skipped == 0 ? 0 : 5;
+    fwprintf(stdout, L"SUMMARY mode=list matches=%u skipped=%u\n", matches, skipped);
+    return 0;
 }

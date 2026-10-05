@@ -25,6 +25,23 @@ bool ModulePath(HMODULE module, std::wstring& path);
 bool ModuleDirectory(HMODULE module, std::wstring& directory);
 bool ProcessImagePath(HANDLE process, std::wstring& path);
 bool ProcessCreationTime(HANDLE process, ULONGLONG& creationTime);
+
+inline std::wstring ControllerObjectName(const wchar_t* testVariable,
+                                         const wchar_t* baseName,
+                                         DWORD pid, ULONGLONG creationTime) {
+    const std::wstring overrideName = ResolveObjectName(testVariable, L"");
+    if (!overrideName.empty()) return overrideName;
+    if (!pid || !creationTime) return {};
+    return std::wstring(baseName) + L"." + std::to_wstring(pid) + L"." +
+           std::to_wstring(creationTime);
+}
+
+inline std::wstring CurrentControllerObjectName(const wchar_t* testVariable,
+                                                const wchar_t* baseName) {
+    ULONGLONG created = 0;
+    if (!ProcessCreationTime(GetCurrentProcess(), created)) return {};
+    return ControllerObjectName(testVariable, baseName, GetCurrentProcessId(), created);
+}
 bool SameProcessArchitecture(HANDLE target, DWORD* error = nullptr);
 bool WriteAll(HANDLE handle, std::string_view bytes);
 bool CurrentUserSidString(std::wstring& sid);

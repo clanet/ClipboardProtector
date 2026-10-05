@@ -127,13 +127,14 @@ enum IpcMsgType : BYTE {
     kIpcSettings = 4,// 主程序 -> DLL：预览与快捷键访问过滤设置
     kIpcShutdown = 5,// 主程序 -> DLL：停止通信并进入 fail-open
     kIpcStateBegin = 6,// 主程序 -> DLL：完整状态快照开始
-    kIpcShutdownAck = 7,// DLL -> 主程序：Detours 已移除且调用清退完成
+    kIpcShutdownAck = 7,// DLL -> 主程序：Detours 已移除；在途调用仍持有模块引用
     kIpcStateAck = 8, // DLL -> 主程序：完整状态已应用，可开始监控
     kIpcRulesExtended = 9, // 主程序 -> 新 DLL：扩展规则快照
     kIpcEventGap = 10, // 新 DLL -> 主程序：无法保留的事件数量
     kIpcConfirmRequest = 11, // DLL -> 主程序：请求用户确认本次访问
     kIpcConfirmResponse = 12, // 主程序 -> DLL：确认结果
     kIpcPrivateClipboard = 13, // 主程序 -> DLL：私有会话映射名称；就绪确认在映射内
+    kIpcShutdownRetained = 14, // Terminal shutdown; Detours/DLL retained, not safely unloadable.
 };
 
 // kIpcEvent 的操作类型

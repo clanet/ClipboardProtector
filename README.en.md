@@ -47,6 +47,8 @@ If input was sent but the operation did not complete, the target clipboard remai
 
 Protection applies only to processes that actually load the Hook DLL. Protected processes, some UWP/AppContainer applications and access bypassing the intercepted APIs may be outside coverage. Verify the final destination address before transferring funds.
 
+Host threads are suspended only during Detours transactions. If a DLL cannot be safely unloaded immediately after protection stops, its reference is retained. Exit the affected target applications before upgrading if they still hold the DLL file open.
+
 Text previews are enabled by default and may retain clipboard prefixes in memory. Exports, notifications and confirmation windows can also contain sensitive information. Image/file snapshots are off by default. Use fictional data in reports and screenshots.
 
 Configuration: `%APPDATA%\ClipboardProtector\config.json`. Before upgrading, exit and replace the complete set of matching components. Before removing the application, disable Windows startup and exit it.

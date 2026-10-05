@@ -24,6 +24,7 @@ add_executable(ClipboardProtector WIN32
   confirmwnd.cpp
   pipeserver.cpp
   injector.cpp
+  hookthread.cpp
   coveragemonitor.cpp
   cryptomonitor.cpp
   ruledlg.cpp

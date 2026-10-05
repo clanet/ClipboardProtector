@@ -117,8 +117,8 @@ int wmain(int argc, wchar_t** argv) {
 
     const bool targetAlive =
         WaitForSingleObject(target.hProcess, 0) == WAIT_TIMEOUT;
-    const bool moduleGone = targetAlive &&
-        WaitForModuleState(target.dwProcessId, argv[3], false, 3000);
+    const bool moduleRetained = targetAlive &&
+        WaitForModuleState(target.dwProcessId, argv[3], true, 3000);
     SetEvent(stop);
     const bool cleanTargetExit =
         WaitForSingleObject(target.hProcess, 5000) == WAIT_OBJECT_0;
@@ -132,15 +132,15 @@ int wmain(int argc, wchar_t** argv) {
     CloseHandle(ready);
     CloseHandle(stop);
 
-    if (unloadWait != WAIT_OBJECT_0 || unloadExit != 0 || !targetAlive ||
-        !moduleGone || !cleanTargetExit || targetExit != 0) {
+    if (unloadWait != WAIT_OBJECT_0 || unloadExit != 3 || !targetAlive ||
+        !moduleRetained || !cleanTargetExit || targetExit != 0) {
         fwprintf(stderr,
                  L"unload-wait=%lu unload-exit=%lu target-alive=%d "
-                 L"module-gone=%d target-clean=%d target-exit=%lu\n",
+                 L"module-retained=%d target-clean=%d target-exit=%lu\n",
                  unloadWait, unloadExit, targetAlive ? 1 : 0,
-                 moduleGone ? 1 : 0, cleanTargetExit ? 1 : 0, targetExit);
+                 moduleRetained ? 1 : 0, cleanTargetExit ? 1 : 0, targetExit);
         return 7;
     }
-    wprintf(L"remote-thread=1 free-library=1 module-gone=1 target-alive=1\n");
+    wprintf(L"unsafe-unload-refused=1 module-retained=1 target-alive=1\n");
     return 0;
 }

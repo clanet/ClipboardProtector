@@ -1747,12 +1747,20 @@ static void detour_free_unused_trampoline_regions()
 //
 struct DetourThread
 {
+#ifdef CLIP_DETOURS_STATIC_NODES
+    static void* operator new(size_t) noexcept;
+    static void operator delete(void*) noexcept {}
+#endif
     DetourThread *      pNext;
     HANDLE              hThread;
 };
 
 struct DetourOperation
 {
+#ifdef CLIP_DETOURS_STATIC_NODES
+    static void* operator new(size_t) noexcept;
+    static void operator delete(void*) noexcept {}
+#endif
     DetourOperation *   pNext;
     BOOL                fIsRemove;
 #ifdef _M_ARM64EC
@@ -1763,6 +1771,28 @@ struct DetourOperation
     PDETOUR_TRAMPOLINE  pTrampoline;
     ULONG               dwPerm;
 };
+
+#ifdef CLIP_DETOURS_STATIC_NODES
+// Local integration: transactions must not allocate/free on the host CRT heap
+// while its owner may be suspended. Transactions are serialized below; these
+// trivial nodes are reused only after the previous commit/abort completes.
+static DetourThread s_clipThreads[4096];
+static DetourOperation s_clipOperations[256];
+static size_t s_clipThreadCount = 0;
+static size_t s_clipOperationCount = 0;
+
+void* DetourThread::operator new(size_t) noexcept
+{
+    return s_clipThreadCount < ARRAYSIZE(s_clipThreads)
+        ? &s_clipThreads[s_clipThreadCount++] : NULL;
+}
+
+void* DetourOperation::operator new(size_t) noexcept
+{
+    return s_clipOperationCount < ARRAYSIZE(s_clipOperations)
+        ? &s_clipOperations[s_clipOperationCount++] : NULL;
+}
+#endif
 
 static BOOL                 s_fIgnoreTooSmall       = FALSE;
 static BOOL                 s_fRetainRegions        = FALSE;
@@ -1883,6 +1913,10 @@ _Benign_race_end_
     s_pPendingOperations = NULL;
     s_pPendingThreads = NULL;
     s_ppPendingError = NULL;
+#ifdef CLIP_DETOURS_STATIC_NODES
+    s_clipThreadCount = 0;
+    s_clipOperationCount = 0;
+#endif
 
     // Make sure the trampoline pages are writable.
     s_nPendingError = detour_writable_trampoline_regions();

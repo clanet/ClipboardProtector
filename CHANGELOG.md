@@ -4,6 +4,16 @@
 
 首个公开开发预览版本，发布日期以 GitHub Release 为准。
 
+- Disable remote FreeLibrary in the DLL inspection tools. Reject --execute because controller exit cannot prove Detour removal or completion of calls through the module.
+- Isolate shared mappings and stop events by controller PID and creation time. Bind Hook workers to the authenticated pipe server before installing Detours, and report IPC startup errors instead of silently exiting.
+- Enumerate only the current process's threads during Detours transactions, retaining thread handles to prevent ID reuse. Distinguish detached, retained, disconnected, and pending shutdown outcomes so failed detachments do not cause an unconditional five-second wait.
+- Add per-process shutdown trace files with monotonic stage timings, thread IDs, and error codes. Record Detour teardown, thread suspension/resumption, global hook removal, pipe acknowledgements, and module rundown. Use preallocated file mappings during suspension so diagnostics do not allocate on the host heap or issue per-record file writes.
+- 退出与卸钩诊断日志默认关闭；复现退弹问题前设置 `CLIP_SHUTDOWN_TRACE=1` 才写入 `Diagnostics`。
+- Exclude the bundled 32-bit Hook host from self-injection, and bypass Hook initialization in both controller processes. Cross-bitness callbacks must not start Detours inside the process responsible for pumping global Hook messages.
+- Keep the native global Hook message loop on a dedicated thread so shutdown acknowledgements, coverage cleanup, and helper waits cannot block it. Preserve the message loop and DLL reference if Hook removal fails, allowing a safe retry.
+- Remove global message hooks before requesting host Detour teardown, and remove the native hook before waiting for the 32-bit helper to exit. Bound helper message draining so continuous traffic cannot starve its stop event.
+- Remove host heap locking from Detours transactions. Use fixed transaction-node storage and preallocated native thread snapshots while threads are suspended; abort preparation when the time budget or storage limit is exceeded. Add heap-owner and partial-freeze rollback regressions.
+- Limit host thread suspension to Detours transactions, check module release safety during detach, and acknowledge shutdown before waiting for in-flight calls. Retain the DLL reference when immediate unloading is unsafe instead of suspending the host again.
 - Enable Crypto address protection by default while preserving existing explicit off settings. Independently monitor clipboard address changes and report them through redacted logs and tray notifications, including changes made by uninjected processes. Observed changes are not reported as blocked.
 - Insert new rules at the top of the list, including rules added from access logs.
 - Enable "Allow copy/paste shortcuts without checking rules" by default while preserving existing explicit off settings.

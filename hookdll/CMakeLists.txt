@@ -21,6 +21,7 @@ add_library(HookDll SHARED
   ${DETOURS}/creatwth.cpp    # 内部包含 uimports.cpp
 )
 target_include_directories(HookDll PRIVATE ${DETOURS})
+target_compile_definitions(HookDll PRIVATE CLIP_DETOURS_STATIC_NODES)
 target_link_libraries(HookDll PRIVATE clip_common ole32 shell32 uuid)
 if(BUILD_TESTING)
   target_compile_definitions(HookDll PRIVATE CLIP_TEST_EXPORTS)

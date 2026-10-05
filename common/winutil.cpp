@@ -110,12 +110,20 @@ bool CurrentUserSidString(std::wstring& sid) {
 bool CreateLocalUserSecurityDescriptor(PSECURITY_DESCRIPTOR* descriptor) {
     if (!descriptor) return false;
     *descriptor = nullptr;
+#ifdef CLIP_TEST_RELAXED_IPC_SECURITY
+    // Disposable, uniquely named test objects contain no user clipboard data.
+    // Include Everyone in both restricted-token access checks for the tests.
+    return ConvertStringSecurityDescriptorToSecurityDescriptorW(
+               L"D:P(A;;GA;;;WD)S:(ML;;NW;;;ME)", SDDL_REVISION_1,
+               descriptor, nullptr) != FALSE;
+#else
     std::wstring userSid;
     if (!CurrentUserSidString(userSid)) return false;
     const std::wstring sddl =
         L"D:P(A;;GA;;;SY)(A;;GA;;;" + userSid + L")S:(ML;;NW;;;ME)";
     return ConvertStringSecurityDescriptorToSecurityDescriptorW(
                sddl.c_str(), SDDL_REVISION_1, descriptor, nullptr) != FALSE;
+#endif
 }
 
 HANDLE CreateLocalUserNamedEvent(const wchar_t* name, BOOL manualReset,

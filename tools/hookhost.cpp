@@ -2,6 +2,7 @@
 #include <shellapi.h>
 #include "remotehook.h"
 #include "winutil.h"
+#include "shutdowntrace.h"
 #include <cwchar>
 #include <string>
 #include <vector>
@@ -103,6 +104,8 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         CloseHandle(controller);
         return 4;
     }
+    clip::ShutdownTrace trace;
+    trace.Open(L"helper", dll);
     auto proc = reinterpret_cast<GetMsgProcFn>(GetProcAddress(dll, "GetMsgProc"));
     HHOOK hook = proc ? SetWindowsHookExW(WH_GETMESSAGE, proc, dll, 0) : nullptr;
     if (!hook) {
@@ -116,14 +119,16 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     HANDLE waits[2] = {controller, stopEvent};
     bool running = true;
     while (running) {
-        DWORD result = MsgWaitForMultipleObjects(2, waits, FALSE, INFINITE,
-                                                 QS_ALLINPUT);
+        DWORD result = MsgWaitForMultipleObjectsEx(2, waits, INFINITE,
+                                                   QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (result == WAIT_OBJECT_0 || result == WAIT_OBJECT_0 + 1 ||
             result == WAIT_FAILED) {
             running = false;
         } else if (result == WAIT_OBJECT_0 + 2) {
             MSG message;
-            while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            // Recheck stop/controller signals even under continuous traffic.
+            for (unsigned count = 0; count < 64 &&
+                 PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE); ++count) {
                 if (message.message == WM_QUIT) {
                     running = false;
                     break;
@@ -134,7 +139,14 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         }
     }
 
-    if (UnhookWindowsHookEx(hook)) FreeLibrary(dll);
+    trace.Mark("UnhookWindowsHookEx.begin");
+    const BOOL removed = UnhookWindowsHookEx(hook);
+    trace.Mark("UnhookWindowsHookEx.end", removed, removed ? ERROR_SUCCESS : GetLastError());
+    if (removed) {
+        trace.Mark("helper.module_release.begin");
+        FreeLibrary(dll);
+        trace.Mark("helper.module_release.end");
+    }
     CloseHandle(stopEvent);
     CloseHandle(controller);
     return 0;

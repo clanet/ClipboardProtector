@@ -2,6 +2,7 @@
 #include "injector.h"
 #include "ipc.h"
 #include "winutil.h"
+#include "shutdowntrace.h"
 #include <tlhelp32.h>
 #include <utility>
 #include <vector>
@@ -196,7 +197,7 @@ bool Injector::InstallForThreadImpl(const std::wstring& hookDllPath,
                                     DWORD threadId, HANDLE targetProcess,
                                     HANDLE targetThread,
                                     const std::wstring& expectedTargetPath) {
-    if (hook_) return true;
+    if (hook_.installed()) return true;
     lastError_ = ERROR_SUCCESS;
     lastErrorText_.clear();
     if (hookDllPath.empty()) {
@@ -253,9 +254,8 @@ bool Injector::InstallForThreadImpl(const std::wstring& hookDllPath,
         mod_ = nullptr;
         return false;
     }
-    hook_ = SetWindowsHookExW(WH_GETMESSAGE, proc, mod_, threadId);
-    if (!hook_) {
-        lastError_ = GetLastError();
+    lastError_ = hook_.Install(proc, mod_, threadId);
+    if (lastError_ != ERROR_SUCCESS) {
         lastErrorText_ = UiText(TextId::SetWindowsHookExWFailed);
         FreeLibrary(mod_);
         mod_ = nullptr;
@@ -270,8 +270,7 @@ bool Injector::InstallForThreadImpl(const std::wstring& hookDllPath,
         const DWORD wakeError = GetLastError();
         // Without a queue wakeup there is no evidence that the targeted hook
         // can ever load. Roll it back, retaining the module if unhook fails.
-        if (UnhookWindowsHookEx(hook_)) {
-            hook_ = nullptr;
+        if (hook_.Remove() == ERROR_SUCCESS) {
             FreeLibrary(mod_);
             mod_ = nullptr;
         }
@@ -426,15 +425,29 @@ bool Injector::Install32BitHelper(const std::wstring& helperPath,
 #endif
 
 bool Injector::Remove() {
+    ShutdownTrace trace;
+    trace.Open(L"injector");
+    trace.Mark("injector.remove.begin");
     bool removed = true;
 #ifdef _WIN64
+    trace.Mark("helper.stop.signal");
     if (helperStopEvent_) SetEvent(helperStopEvent_);
+#endif
+    // Start both removals before waiting for the helper process to exit.
+    trace.Mark("native_hook.remove.begin");
+    const DWORD hookResult = hook_.Remove();
+    trace.Mark("native_hook.remove.end", 0, hookResult);
+#ifdef _WIN64
     if (helperProcess_) {
+        trace.Mark("helper.wait.begin");
         DWORD result = WaitForSingleObject(helperProcess_, 5000);
+        trace.Mark("helper.wait.end", result, result == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS);
         if (result != WAIT_OBJECT_0) {
+            trace.Mark("helper.terminate.begin");
             if (!TerminateProcess(helperProcess_, ERROR_PROCESS_ABORTED) ||
                 WaitForSingleObject(helperProcess_, 5000) != WAIT_OBJECT_0)
                 removed = false;
+            trace.Mark("helper.terminate.end", removed);
         }
         CloseHandle(helperProcess_);
         helperProcess_ = nullptr;
@@ -444,15 +457,14 @@ bool Injector::Remove() {
         helperStopEvent_ = nullptr;
     }
 #endif
-    if (hook_) {
-        // 失败时必须保留 DLL 引用，否则仍有效的 Hook 会跳进已卸载代码。
-        if (!UnhookWindowsHookEx(hook_)) return false;
-        hook_ = nullptr;
-    }
+    if (hookResult != ERROR_SUCCESS) return false;
     if (mod_) {
+        trace.Mark("controller.module_release.begin");
         FreeLibrary(mod_);
+        trace.Mark("controller.module_release.end");
         mod_ = nullptr;
     }
+    trace.Mark("injector.remove.end", removed);
     return removed;
 }
 

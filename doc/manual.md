@@ -107,20 +107,18 @@ CTest：`hook_smoke`、`common_smoke`、`injection_smoke`、`injector_smoke`、
 
 ## 旧版 DLL 应急清理
 
-新版程序会协作式安全卸载 DLL。以下维护工具只用于清理修复前已经遗留在目标进程中的旧
-模块，不能代替正常的“停止监控”流程。工具要求传入 DLL 绝对路径并按完整路径匹配；省略
-`--execute` 时只列出目标，不修改进程：
+程序会协作式解除 Hook，并在安全时卸载 DLL；拆钩失败或未返回的调用仍可能需要保留模块引用。
+以下工具现在只扫描指定 DLL 的残留位置，不修改目标进程。工具要求传入 DLL 绝对路径并按完整路径匹配：
 
 ```text
 HookDllUnloader.exe --dll D:\absolute\path\HookDll.dll
-HookDllUnloader.exe --dll D:\absolute\path\HookDll.dll --execute
-HookDllUnloader32.exe --dll D:\absolute\path\HookDll32.dll --execute
+HookDllUnloader.exe --dll D:\absolute\path\HookDll.dll --include-system
+HookDllUnloader32.exe --dll D:\absolute\path\HookDll32.dll
 ```
 
-可用 `--pid <PID>` 限制为单个进程。默认跳过 Windows 目录中的进程；确认已停止
-`ClipboardProtector.exe` 后，才可额外传入 `--include-system`。工具会拒绝关键进程，且每个
-匹配模块只调用一次远程 `FreeLibrary`，不会循环递减未知引用计数。即便如此，强制卸载旧 DLL
-仍可能使正在执行旧 Hook 代码的目标程序崩溃，优先选择重启目标程序、注销或重启系统。
+可用 `--pid <PID>` 限制为单个进程，`--include-system` 仅扩大扫描范围。`--execute` 明确拒绝执行，
+不会创建远程线程或调用 `FreeLibrary`。主程序已退出不能证明 Detours 已解除；强制释放仍有跳转或返回地址引用的
+DLL 会使宿主崩溃。残留模块应通过重启相应程序、注销或重启系统清理。
 
 开发构建可以不弹 UAC，但仍然不应在物理主机加载全局 Hook：
 
@@ -168,7 +166,7 @@ build/dev/x64/bin/Release/
 
 `product_coverage_smoke` 只在测试构建中启用全局巡检，并用 `CLIP_TEST_COVERAGE_TARGET_PATH`
 把目标限制为自行复制的 `clipclient`。它用 `nopump` 模式验证：没有消息循环的进程仍能被远程
-初始化，短暂进程退出后连接数回落，主程序退出后模块从仍存活的目标中卸载。x64 构建若提供
+初始化，短暂进程退出后连接数回落，主程序退出后模块从仍存活且已空闲的目标中卸载。x64 构建若提供
 Win32 `clipclient.exe`，还会额外运行 `product_coverage_x86_smoke`。该测试会设置
 `CLIPBOARDPROTECTOR_ENABLE_GLOBAL_HOOK=1`，只能在隔离环境运行。
 
@@ -227,9 +225,10 @@ Sandbox 自己的剪贴板。脚本绝不设置 `CLIPBOARDPROTECTOR_ENABLE_GLOBA
 保护并确认同一读取放行，恢复保护后确认再次阻止。随后脚本向主 UI 线程投递 `WM_QUIT`，
 要求程序走正常清理路径；测试版 DLL 的诊断导出必须从 installed 变为 detached，且仍存活的
 `clipclient` 必须在主程序退出后再次成功完成真实剪贴板 roundtrip，最后自然退出。
-DLL 会先解除 Detours、等待正在执行的 Hook 调用完成，再由 worker 通过
-`FreeLibraryAndExitThread` 释放额外模块引用；控制端卸载系统 Hook 后，模块必须从仍存活的
-目标进程中消失。只有 Detours 无法安全解除时才会保守地保留模块到目标进程退出。
+DLL 在解除 Detours 的同一次事务内检查在途调用及线程执行位置。能确认安全时，由 worker 通过
+`FreeLibraryAndExitThread` 释放额外模块引用；控制端卸载系统 Hook 后，模块应从仍存活且空闲的
+目标进程中消失。无法确认安全时保留引用，后续空闲卸钩时可释放，或由目标进程退出回收。
+已解除 Detours 的目标先回复关闭确认、断开管道；后台 worker 等旧调用返回后再关闭共享映射与控制句柄，期间不挂起宿主线程。
 整个验收不会用 `TerminateProcess` 掩盖生命周期问题。
 
 结构化结果和日志写入 `sandbox-results/<时间戳>/`。只生成配置但不启动 GUI 可使用：
@@ -456,14 +455,49 @@ Hook 端和主程序端都使用有界事件队列。Hook 热路径只进行短�
 5. 跳过 PID 0/4、主程序自身、关键/受保护进程、内部组件、其它会话和其它用户。测试构建还要求
    `CLIP_TEST_COVERAGE_TARGET_PATH` 精确匹配，避免误伤其它程序。
 
-关闭全局注入时先停止巡检，再通知已连接 DLL 进入 fail-open、解除 Detours 并完成调用清退，
-最后卸载系统 Hook 和远程加载留下的额外模块引用。
+关闭全局注入时先停止巡检、移除系统消息 Hook，再通知已连接 DLL 进入 fail-open 并解除 Detours，
+收到关闭确认后释放远程加载留下的额外模块引用。DLL worker 持有独立引用，因此移除系统 Hook 不会提前卸载正在拆钩的代码。仍有在途调用时，DLL 自身的引用及相关资源继续保留，避免旧调用返回到已释放内存。
 
 保护范围切换和退出清理由同一个常驻后台线程执行；该线程在空闲时处理消息，确保安装的
 Windows Hook 一直有有效的所属线程。切换期间主窗口仍可响应，退出请求会排在当前操作之后。
-Detours 的指令解析和跳板准备移到暂停线程之前，提交事务时仍会暂停目标线程；卸载检查失败
-后的重试间隔逐步增加，避免密集暂停目标。真正卸载前仍保留调用清退检查，因此无响应目标
-仍可能延长清理时间。
+Detours 的指令解析、跳板准备和快照存储分配在暂停线程前完成；提交事务时仍会暂停目标线程。线程通过 `NtGetNextThread` 仅枚举当前进程，并保留句柄防止线程 ID 重用，不再查询整个系统的进程和线程。暂停期间不锁定宿主堆或调用 Toolhelp；Detours 事务节点使用固定存储（最多 4096 个线程、256 个操作）。枚举与线程登记阶段检查 100ms 预算；超时、容量不足或查询失败则中止事务并恢复线程。预算不能中断正在执行的系统调用，不能视为整个暂停阶段的硬性时间上限。
+
+共享内存和停止事件按控制端 PID 与进程创建时间命名。DLL 在验证管道服务端路径及进程身份后打开对应对象，并监视控制端进程退出；上次保留的 DLL 不会阻止新实例创建通信对象。拆钩成功和拆钩失败保留 DLL 使用不同的关闭确认；已断开的客户端不再导致固定等待 5 秒，断开本身不代表拆钩成功。
+
+卸载安全检查复用事务内已经暂停的线程，不再在事务结束后额外挂起、反复扫描目标。检查未通过时保留 DLL 引用；旧调用清退在回复关闭确认后由后台 worker 被动等待，不阻塞控制端等待确认。若卸钩事务中止，普通保护保持 fail-open 并保留模块，私有剪贴板的必要隔离不取消。
+
+控制端的原生 `WH_GETMESSAGE` 由独立线程安装、处理消息和卸载。启停工作线程等待巡检、管道关闭确认或 32 位辅助进程期间，该消息循环保持运行，避免跨位数全局 Hook 回调被这些等待阻塞。卸载失败时保留 Hook 线程和 DLL 引用，继续处理消息并允许重试；32 位辅助进程继续使用自己的消息循环。
+
+与 DLL 同目录的 `ClipboardProtector.exe` 和 `HookHost32.exe` 均跳过自身 Hook 初始化，防止跨位数回调在辅助进程内安装 Detours、暂停负责全局回调的消息线程。此排除按完整路径识别，不排除其他目录下的同名程序。
+
+忙碌目标中的 DLL 可能暂时驻留，后续重新开启保护时复用已有引用；若旧调用一直未返回，需要等待调用结束或重启目标程序。升级时，如 DLL 文件仍被目标程序占用，应先退出相应程序。Detours 必要的暂停、巡检停止、管道与跨位数辅助进程等待仍然存在，这不代表全局开关在所有目标上都能瞬间完成。
+
+## 退出卡顿诊断日志
+
+诊断日志默认关闭，不写任何 `shutdown-*.log`。复现问题前在被测进程（主程序与各宿主进程）的启动环境中设置 `CLIP_SHUTDOWN_TRACE=1` 才开始记录，目录为 `%LOCALAPPDATA%\ClipboardProtector\Diagnostics\`。日志是 UTF-8 文本，文件名包含角色、PID、线程 ID 和时间标识；每次操作创建独立文件，不用一把跨进程文件锁串行写日志。日志头包含构建时间、位数、进程名、模块名和 UTC 开始时间，不记录剪贴板内容。
+
+- `shutdown-controller-exit-*.log`：主程序退出，包括停止巡检、移除全局 Hook、停止管道和释放额外模块引用。
+- `shutdown-hook-p*.log`：各宿主中的 DLL 卸钩，包括私有剪贴板检查、快照、逐线程暂停/登记/恢复、事务提交/回滚、关闭确认和在途调用清退。
+- `shutdown-hook-owner-*.log`、`shutdown-helper-*.log`：原生及 32 位全局 `UnhookWindowsHookEx`。
+- `shutdown-injector-*.log`、`shutdown-pipe-server-*.log`、`shutdown-coverage-release-*.log`：辅助进程等待、管道关闭确认、逐 PID 远程释放。
+
+每条记录的 `elapsed_us` 是从该日志开始计时的微秒数，`step_us` 是距上一条记录的微秒数；除以 1000 得到毫秒。`tick_ms` 是本机启动以来的毫秒数，可用于对齐不同进程。`stage` 以 `.begin` / `.end` 标记操作边界；某条 `.end` 的 `step_us` 很大，或者只出现 `.begin`，说明耗时或停留发生在该操作区间。`value` 是线程/PID、计数或布尔结果，`error` 是适用时记录的错误码；不能单凭缺少 `.end` 就断言死锁，也可能是进程退出或日志写入失败。
+
+例如 `stage=transaction.commit.end step_us=...` 对应 Detours 提交区间；`rundown.waiting` 的 `value` 表示仍在执行的调用数；`worker.module_release.next` 表示即将释放 DLL 引用，不能视为已完成卸载。
+
+管道日志中的 `server.client.detached` 表示收到拆钩成功确认，`server.client.retained` 表示收到保留 DLL 的终态确认，`server.client.disconnected` 表示连接已结束但没有成功确认，`server.client.pending` 表示等待截止时仍未完成；`value` 为对应 PID。
+
+日志在暂停线程前创建并映射，暂停期间只更新预分配的文本记录，不调用 `WriteFile`、堆分配或逐条刷盘；其他进程可以在卸钩尚未结束时读取最后阶段。结束后关闭映射并截掉未使用的空白。每个日志最多约 1 MiB，超过 4096 条后保留开头和最后一条，`seq` 会出现跳号；卡住或异常退出的文件可能带有预分配空白。日志不保证断电落盘，映射和计时也仍有开销。复现完成后可删除诊断目录中的旧日志，程序不会自动清理历史文件。
+
+需要改变日志位置时，在被测进程启动前设置 `CLIP_SHUTDOWN_LOG_DIR`；该目录的父目录应已存在。`CLIP_SHUTDOWN_TRACE=1` 开启记录；默认（未设置或其它值）不记录。环境变量以每个进程自身继承的环境为准，给控制端设置变量不会自动改变已经运行的宿主进程。目录不可写时跳过日志，不改变卸钩结果。
+
+可在 PowerShell 中查看最新记录（也可直接用文本编辑器打开）：
+
+```powershell
+Get-ChildItem "$env:LOCALAPPDATA\ClipboardProtector\Diagnostics\*.log" |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 10 Name, LastWriteTime, Length
+```
 
 ## 权限与限制
 

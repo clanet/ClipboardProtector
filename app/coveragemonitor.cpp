@@ -3,6 +3,7 @@
 #include "pipeserver.h"
 #include "remotehook.h"
 #include "winutil.h"
+#include "shutdowntrace.h"
 
 #include <tlhelp32.h>
 #include <algorithm>
@@ -434,6 +435,8 @@ bool CoverageMonitor::ReleaseTarget(const Entry& entry) {
 
 void CoverageMonitor::ReleaseRetainedReferences() {
     if (thread_) return;
+    ShutdownTrace trace;
+    trace.Open(L"coverage-release");
     // 每次释放是一次远程 FreeLibrary（卡在加载器锁的宿主上最多 5s）。
     // 退出路径给整个清理一个总上限：超限条目按泄漏处理，DLL 在宿主中
     // 保留 fail-open 状态，比把退出拖住几分钟更可接受。
@@ -443,8 +446,14 @@ void CoverageMonitor::ReleaseRetainedReferences() {
         for (auto& item : entries_) {
             Entry& entry = item.second;
             if (!entry.retainedReference) continue;
-            if (GetTickCount64() >= deadline) return;
-            if (ReleaseTarget(entry))
+            if (GetTickCount64() >= deadline) {
+                trace.Mark("coverage.release.deadline", entry.processId, WAIT_TIMEOUT);
+                return;
+            }
+            trace.Mark("coverage.target_release.begin", entry.processId);
+            const bool released = ReleaseTarget(entry);
+            trace.Mark(released ? "coverage.target_release.ok" : "coverage.target_release.failed", entry.processId);
+            if (released)
                 entry.retainedReference = false;
             else
                 pending = true;

@@ -496,8 +496,8 @@ void MainWindow::JoinProtectionOperation() {
 }
 
 void MainWindow::RunProtectionWorker() {
-    // Windows hooks belong to the installing thread. Keep that thread alive
-    // and pumping messages between operations, until its hooks are removed.
+    // HookThread owns the native hook and pumps independently, including
+    // while a protection task below waits for shutdown acknowledgements.
     for (;;) {
         const DWORD wait = MsgWaitForMultipleObjectsEx(
             1, &protectionWorkEvent_, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);

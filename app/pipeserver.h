@@ -78,6 +78,7 @@ private:
         std::deque<std::string> privateRequests;
         std::atomic<unsigned long long> deliveredVersion{0};
         std::atomic<bool> shutdownAck{false};
+        std::atomic<bool> shutdownRetained{false};
         std::atomic<bool> stateReady{false};
         std::atomic<bool> privateClipboardCapable{false};
         std::atomic<bool> textMetadataCapable{false};

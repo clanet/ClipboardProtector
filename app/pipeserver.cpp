@@ -4,6 +4,7 @@
 #include "ipc.h"
 #include "rules.h"
 #include "winutil.h"
+#include "shutdowntrace.h"
 #include <sddl.h>
 #include <algorithm>
 #include <new>
@@ -319,8 +320,9 @@ bool PipeServer::EnsureSourceMapping() {
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     if (!CreateLocalUserSecurityDescriptor(&descriptor)) return false;
     SECURITY_ATTRIBUTES security = {sizeof(security), descriptor, FALSE};
-    const std::wstring name = ResolveObjectName(
+    const std::wstring name = CurrentControllerObjectName(
         L"CLIP_TEST_SOURCE_MAP", kClipboardSourceMapName);
+    if (name.empty()) { LocalFree(descriptor); return false; }
 
     sourceMapping_ = CreateFileMappingW(
         INVALID_HANDLE_VALUE, &security, PAGE_READWRITE, 0,
@@ -351,8 +353,9 @@ bool PipeServer::EnsureCryptoMapping() {
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     if (!CreateLocalUserSecurityDescriptor(&descriptor)) return false;
     SECURITY_ATTRIBUTES security = {sizeof(security), descriptor, FALSE};
-    const std::wstring name = ResolveObjectName(
+    const std::wstring name = CurrentControllerObjectName(
         L"CLIP_TEST_CRYPTO_MAP", kCryptoProtectionMapName);
+    if (name.empty()) { LocalFree(descriptor); return false; }
 
     cryptoMapping_ = CreateFileMappingW(
         INVALID_HANDLE_VALUE, &security, PAGE_READWRITE, 0,
@@ -485,7 +488,11 @@ bool PipeServer::Start(HWND notifyWnd, bool targetedMode, DWORD targetedPid) {
         return false;
     }
     const std::wstring stopEventName =
-        ResolveObjectName(L"CLIP_TEST_STOP_EVENT", kStopEventName);
+        CurrentControllerObjectName(L"CLIP_TEST_STOP_EVENT", kStopEventName);
+    if (stopEventName.empty()) {
+        rollbackStart(ERROR_INVALID_NAME);
+        return false;
+    }
     if (!stopEvent_) {
         stopEvent_ = CreateLocalUserNamedEvent(stopEventName.c_str(), TRUE, FALSE);
         const DWORD createError = GetLastError();
@@ -589,12 +596,16 @@ bool PipeServer::Start(HWND notifyWnd, bool targetedMode, DWORD targetedPid) {
 }
 
 void PipeServer::Stop() {
+    ShutdownTrace trace;
+    trace.Open(L"pipe-server");
+    trace.Mark("server.stop.begin");
     PublishCryptoSetting(false, true);
     if (!listenThread_) return;
     // Prevent late worker notifications from targeting a window that is being
     // torn down. The pipe threads only use this atomic snapshot for PostMessage.
     const HWND notifyWnd = wnd_.exchange(nullptr, std::memory_order_acq_rel);
     bool cancelledConfirmations = false;
+    trace.Mark("server.confirmations.begin");
     {
         std::lock_guard<std::mutex> lock(confirmationsMu_);
         for (const auto& target : confirmationTargets_) {
@@ -614,6 +625,7 @@ void PipeServer::Stop() {
     }
     if (cancelledConfirmations && notifyWnd)
         PostMessageW(notifyWnd, kMsgConfirmation, 0, 0);
+    trace.Mark("server.confirmations.end");
     // Stop accepting new clients immediately. Existing clients still get the
     // shutdown frame and have a bounded window to acknowledge it.
     accepting_.store(false, std::memory_order_release);
@@ -628,6 +640,7 @@ void PipeServer::Stop() {
         shutdownVersion = ++stateVersion_;
     }
     stop_.store(true, std::memory_order_release);
+    trace.Mark("server.shutdown_published");
 
     HANDLE initial = INVALID_HANDLE_VALUE;
     {
@@ -640,45 +653,68 @@ void PipeServer::Stop() {
     HANDLE wake = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
                               nullptr, OPEN_EXISTING, 0, nullptr);
     if (wake != INVALID_HANDLE_VALUE) CloseHandle(wake);
+    trace.Mark("server.listener_woken");
 
-    // Give each worker enough time to remove Detours, finish call rundown, and
-    // return its ACK; unloading a system hook before that is unsafe.
+    // Give each worker time to remove Detours and acknowledge shutdown. A
+    // worker retains its module reference if calls still need its code pages.
     ULONGLONG deadline = GetTickCount64() + 5000;
+    trace.Mark("server.shutdown_acks.begin");
     for (;;) {
         ReapClients();
         bool delivered = true;
         {
         std::lock_guard<std::mutex> lock(clientsMu_);
             for (ClientCtx* ctx : clients_) {
+                if (ctx->finished.load(std::memory_order_acquire)) continue;
                 if (ctx->deliveredVersion.load(std::memory_order_acquire) <
                     shutdownVersion ||
-                    !ctx->shutdownAck.load(std::memory_order_acquire)) {
+                    (!ctx->shutdownAck.load(std::memory_order_acquire) &&
+                     !ctx->shutdownRetained.load(std::memory_order_acquire))) {
                     delivered = false;
                     break;
                 }
             }
         }
-        if (delivered || GetTickCount64() >= deadline) break;
+        if (delivered || GetTickCount64() >= deadline) {
+            trace.Mark("server.shutdown_acks.end", delivered, delivered ? ERROR_SUCCESS : WAIT_TIMEOUT);
+            break;
+        }
         Sleep(10);
     }
+    {
+        std::lock_guard<std::mutex> lock(clientsMu_);
+        for (ClientCtx* ctx : clients_) {
+            const char* outcome = ctx->shutdownAck.load() ? "server.client.detached" :
+                ctx->shutdownRetained.load() ? "server.client.retained" :
+                ctx->finished.load() ? "server.client.disconnected" : "server.client.pending";
+            trace.Mark(outcome, ctx->pid);
+        }
+    }
     HANDLE listener = listenThread_;
+    trace.Mark("server.listener_wait.begin");
     DWORD listenerResult = WaitForSingleObject(listener, 5000);
+    trace.Mark("server.listener_wait.end", listenerResult);
     if (listenerResult != WAIT_OBJECT_0) {
+        trace.Mark("server.listener_cancel.begin");
         CancelSynchronousIo(listener);
         // Keep the handle and object ownership if cancellation is slow. The
         // UI stop remains bounded; the destructor performs the final wait.
         listenerResult = WaitForSingleObject(listener, 2000);
+        trace.Mark("server.listener_cancel.end", listenerResult);
     }
     if (listenerResult == WAIT_OBJECT_0) CloseHandle(listener);
     if (listenerResult == WAIT_OBJECT_0) listenThread_ = nullptr;
     SetEvent(stopEvent_);
+    trace.Mark("server.clients_stop.begin");
     StopClients(false);
+    trace.Mark("server.clients_stop.end");
     {
         std::lock_guard<std::mutex> lock(eventsMu_);
         events_.clear();
         eventsSnapshotBytes_ = 0;
         serverDroppedEvents_ = 0;
     }
+    trace.Mark("server.stop.end");
 }
 
 void PipeServer::BroadcastRules(const std::vector<Rule>& rules) {
@@ -1253,8 +1289,8 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
 
         if (state.shuttingDown) {
             if (WriteAll(pipe, ShutdownMessage())) {
-                // Wait for fail-open, Detour removal, and call rundown before
-                // allowing the injector to remove its system hook.
+                // ACK confirms fail-open and Detour removal. In-flight calls
+                // retain their own module reference until they return.
                 ULONGLONG deadline = GetTickCount64() + 3000;
                 while (GetTickCount64() < deadline) {
                     DWORD available = 0;
@@ -1283,9 +1319,13 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
                             if (frame.type == kIpcShutdownAck &&
                                 frame.payloadSize == 0)
                                 ctx->shutdownAck.store(true, std::memory_order_release);
+                            if (frame.type == kIpcShutdownRetained &&
+                                frame.payloadSize == 0)
+                                ctx->shutdownRetained.store(true, std::memory_order_release);
                         }
                         input.erase(0, offset);
-                        if (ctx->shutdownAck.load(std::memory_order_acquire)) break;
+                        if (ctx->shutdownAck.load(std::memory_order_acquire) ||
+                            ctx->shutdownRetained.load(std::memory_order_acquire)) break;
                     }
                     Sleep(10);
                 }

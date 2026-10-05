@@ -7,14 +7,15 @@
 //  - 钩子函数体全部 SEH 包裹：本 DLL 内部异常绝不外溢到宿主。
 //  - 事件经队列 + 专用线程异步写管道；管道断开自动重连。
 //  - Detours 挂载在管道线程内完成，避开 DllMain 加载器锁。
-//    对已运行进程：先锁本 DLL 的 CRT 堆并挂起其他线程至快照稳定，再 Begin/Attach/Commit；
-//    析构路径必 Resume，避免漏挂线程改写崩溃，以及 Commit/Abort 在堆锁上死等。
+//    准备事务和首份线程快照后，仅在提交阶段挂起其他线程至快照稳定。
+//    卸载安全检查复用事务内的暂停；仍有在途调用时保留模块引用，不再额外挂起宿主。
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
-#include <tlhelp32.h>
 #include "detours.h"
 #include "privateclip.h"
+#include "threadsnapshot.h"
+#include "shutdowntrace.h"
 #include "../common/ipc.h"
 #include "../common/rules.h"
 #include "../common/config.h"   // RuleAction 枚举
@@ -28,7 +29,6 @@
 #include <atomic>
 #include <algorithm>
 #include <memory>
-#include <malloc.h>
 
 static HMODULE g_self = nullptr;
 static bool g_isSelf = false;
@@ -40,8 +40,12 @@ static std::atomic<bool> g_stop{false};
 
 static std::atomic<bool> g_workerStarted{false};
 static std::atomic<HMODULE> g_workerModule{nullptr};
+static std::atomic<bool> g_moduleSafeToRelease{true};
 static HANDLE g_stopEvent = nullptr;
 static HANDLE g_controllerMutex = nullptr;
+static HANDLE g_controllerProcess = nullptr;
+static DWORD g_controllerPid = 0;
+static ULONGLONG g_controllerCreated = 0;
 static HANDLE g_sourceMapping = nullptr;
 static clip::SharedClipboardSource* g_source = nullptr;
 static HANDLE g_cryptoMapping = nullptr;
@@ -189,10 +193,14 @@ static bool IsSelfProcess() noexcept {
     wchar_t* altSlash = wcsrchr(dllPath, L'/');
     if (!slash || (altSlash && altSlash > slash)) slash = altSlash;
     size_t prefix = slash ? (size_t)(slash - dllPath + 1) : 0;
-    constexpr wchar_t fileName[] = L"ClipboardProtector.exe";
-    if (prefix + _countof(fileName) > _countof(dllPath)) return false;
-    wcscpy_s(dllPath + prefix, _countof(dllPath) - prefix, fileName);
-    return _wcsicmp(processPath, dllPath) == 0;
+    // Cross-bitness callbacks execute in the installing process. Neither
+    // hook owner may install Detours and suspend its own message pump.
+    for (const wchar_t* name : {L"ClipboardProtector.exe", L"HookHost32.exe"}) {
+        if (prefix + wcslen(name) + 1 > _countof(dllPath)) continue;
+        wcscpy_s(dllPath + prefix, _countof(dllPath) - prefix, name);
+        if (_wcsicmp(processPath, dllPath) == 0) return true;
+    }
+    return false;
 }
 
 static void PrepareProcessIdentity() {
@@ -222,8 +230,10 @@ static void CloseSourceMapping() noexcept {
 
 static void OpenSourceMapping() {
     CloseSourceMapping();
-    const std::wstring name = clip::ResolveObjectName(
-        L"CLIP_TEST_SOURCE_MAP", clip::kClipboardSourceMapName);
+    const std::wstring name = clip::ControllerObjectName(
+        L"CLIP_TEST_SOURCE_MAP", clip::kClipboardSourceMapName,
+        g_controllerPid, g_controllerCreated);
+    if (name.empty()) return;
     g_sourceMapping = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE,
                                        name.c_str());
     if (!g_sourceMapping) return;
@@ -246,8 +256,10 @@ static void CloseCryptoMapping() noexcept {
 
 static void OpenCryptoMapping() {
     CloseCryptoMapping();
-    const std::wstring name = clip::ResolveObjectName(
-        L"CLIP_TEST_CRYPTO_MAP", clip::kCryptoProtectionMapName);
+    const std::wstring name = clip::ControllerObjectName(
+        L"CLIP_TEST_CRYPTO_MAP", clip::kCryptoProtectionMapName,
+        g_controllerPid, g_controllerCreated);
+    if (name.empty()) return;
     g_cryptoMapping = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE,
                                        name.c_str());
     if (!g_cryptoMapping) return;
@@ -1134,14 +1146,21 @@ static void CloseControllerSignals() {
         CloseHandle(g_controllerMutex);
         g_controllerMutex = nullptr;
     }
+    if (g_controllerProcess) {
+        CloseHandle(g_controllerProcess);
+        g_controllerProcess = nullptr;
+    }
+    g_controllerPid = 0;
+    g_controllerCreated = 0;
 }
 
 static bool WaitForStop(DWORD timeout) {
     if (g_stop.load(std::memory_order_acquire)) return true;
-    HANDLE handles[2] = {};
-    bool mutexHandle[2] = {};
+    HANDLE handles[3] = {};
+    bool mutexHandle[3] = {};
     DWORD count = 0;
     if (g_stopEvent) handles[count++] = g_stopEvent;
+    if (g_controllerProcess) handles[count++] = g_controllerProcess;
     if (g_controllerMutex) {
         mutexHandle[count] = true;
         handles[count++] = g_controllerMutex;
@@ -1174,25 +1193,54 @@ static bool WaitForStop(DWORD timeout) {
     return true;
 }
 
-static bool IsTrustedPipeServer(HANDLE pipe) {
+static bool BindPipeServer(HANDLE pipe) {
     ULONG pid = 0;
     if (!GetNamedPipeServerProcessId(pipe, &pid) || pid == 0) return false;
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
     if (!process) return false;
     std::wstring serverPath;
-    const bool ok = clip::ProcessImagePath(process, serverPath);
-    CloseHandle(process);
-    if (!ok) return false;
+    ULONGLONG created = 0;
+    const bool ok = clip::ProcessImagePath(process, serverPath) &&
+                    clip::ProcessCreationTime(process, created) &&
+                    WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+    if (!ok) { CloseHandle(process); return false; }
 
     std::wstring expected;
 #ifdef CLIP_TEST_EXPORTS
     expected = clip::ResolveObjectName(L"CLIP_TEST_SERVER_PATH", L"");
 #endif
     if (expected.empty()) {
-        if (!clip::ModuleDirectory(g_self, expected)) return false;
+        if (!clip::ModuleDirectory(g_self, expected)) {
+            CloseHandle(process);
+            return false;
+        }
         expected += L"ClipboardProtector.exe";
     }
-    return _wcsicmp(expected.c_str(), serverPath.c_str()) == 0;
+    if (_wcsicmp(expected.c_str(), serverPath.c_str()) != 0) {
+        CloseHandle(process);
+        return false;
+    }
+    if (g_controllerProcess) {
+        CloseHandle(process);
+        const bool same = pid == g_controllerPid && created == g_controllerCreated;
+        // Never let a retained worker switch to another controller's mappings.
+        if (!same) g_stop.store(true, std::memory_order_release);
+        return same;
+    }
+    const std::wstring stopName = clip::ControllerObjectName(
+        L"CLIP_TEST_STOP_EVENT", clip::kStopEventName, pid, created);
+    if (!g_stopEvent) g_stopEvent = OpenEventW(SYNCHRONIZE, FALSE, stopName.c_str());
+    if (!g_stopEvent || WaitForSingleObject(g_stopEvent, 0) != WAIT_TIMEOUT) {
+        CloseHandle(process);
+        g_stop.store(true, std::memory_order_release);
+        return false;
+    }
+    g_controllerProcess = process;
+    g_controllerPid = pid;
+    g_controllerCreated = created;
+    if (!g_source) OpenSourceMapping();
+    if (!g_crypto) OpenCryptoMapping();
+    return true;
 }
 
 static bool SendEvent(const PendingEvent& e) {
@@ -1594,6 +1642,9 @@ static std::atomic<long> g_dbThread{0}, g_dbTxBegin{-1}, g_dbA1{-1}, g_dbA2{-1},
                          g_dbA3{-1}, g_dbCommit{-1}, g_dbPipe{0}, g_dbThreads{0};
 #ifdef CLIP_TEST_EXPORTS
 static std::atomic<long> g_testHookCalls{0};
+static std::atomic<long> g_testFreezeCalls{0};
+static std::atomic<HANDLE> g_testDetachedEvent{nullptr};
+static std::atomic<HANDLE> g_testWorkerStoppedEvent{nullptr};
 extern "C" __declspec(dllexport) BOOL ClipHookPrivateArmForTest(const wchar_t* name) {
     if (!name || !g_hooksInstalled.load()) return FALSE;
     privateclip::Arm(name);
@@ -1608,6 +1659,11 @@ extern "C" __declspec(dllexport) DWORD ClipHookPrivateDiagnosticsForTest() {
 #endif
 
 #ifdef CLIP_TEST_EXPORTS
+extern "C" __declspec(dllexport)
+long ClipHookOwnerForTest() {
+    return g_isSelf ? 1 : 0;
+}
+
 extern "C" __declspec(dllexport)
 void ClipHookDebug(long out[8]) {
     if (!out) return;
@@ -1645,13 +1701,44 @@ extern "C" __declspec(dllexport)
 long ClipHookCallsForTest() {
     return g_testHookCalls.load(std::memory_order_acquire);
 }
+
+extern "C" __declspec(dllexport)
+long ClipHookFreezeCallsForTest() {
+    return g_testFreezeCalls.load(std::memory_order_acquire);
+}
+
+extern "C" __declspec(dllexport)
+void ClipHookLifecycleEventsForTest(HANDLE detached, HANDLE stopped) {
+    g_testDetachedEvent.store(detached, std::memory_order_release);
+    g_testWorkerStoppedEvent.store(stopped, std::memory_order_release);
+}
+
+extern "C" __declspec(dllexport)
+BOOL ClipHookHoldCallForTest(HANDLE entered, HANDLE release) {
+    g_activeDetourCalls.fetch_add(1, std::memory_order_acq_rel);
+    const HANDLE stop = g_stopEvent;
+    const HANDLE owner = g_controllerMutex;
+    SetEvent(entered);
+    const DWORD wait = WaitForSingleObject(release, 10000);
+    DWORD flags = 0;
+    const bool handlesValid = GetHandleInformation(stop, &flags) &&
+                              GetHandleInformation(owner, &flags);
+    g_activeDetourCalls.fetch_sub(1, std::memory_order_acq_rel);
+    return wait == WAIT_OBJECT_0 && handlesValid;
+}
 #endif
 
 // 事务期间禁止扩容：先 reserve，再挂起宿主线程。
 static constexpr size_t kMaxFrozenThreads = 4096;
 static constexpr int kFreezeStableRounds = 8;
+static constexpr ULONGLONG kFreezeBudgetMs = 100;
+static std::atomic<ULONGLONG> g_lastFreezeMicros{0};
+#ifdef CLIP_TEST_EXPORTS
+static std::atomic<DWORD> g_testAbortFreeze{0};
+#endif
 
 struct FrozenThreads {
+    clip::ShutdownTrace* trace = nullptr;
     std::vector<HANDLE> handles;
     std::vector<DWORD> ids;
 
@@ -1684,8 +1771,12 @@ struct FrozenThreads {
     }
 
     void ThawAndClose() noexcept {
-        for (HANDLE thread : handles) {
-            ResumeThread(thread);
+        for (size_t index = 0; index < handles.size(); ++index) {
+            HANDLE thread = handles[index];
+            clip::TraceMark(trace, "thread.resume.begin", ids[index]);
+            const DWORD count = ResumeThread(thread);
+            clip::TraceMark(trace, "thread.resume.end", ids[index],
+                            count == DWORD(-1) ? GetLastError() : ERROR_SUCCESS);
             CloseHandle(thread);
         }
         handles.clear();
@@ -1717,15 +1808,21 @@ static bool SelfModuleRange(ULONG_PTR& begin, ULONG_PTR& end) noexcept {
     }
 }
 
-static bool FrozenThreadsOutsideSelf(const FrozenThreads& frozen) noexcept {
+static bool FrozenThreadsOutsideSelf(const FrozenThreads& frozen,
+                                    ULONGLONG deadline) noexcept {
     ULONG_PTR moduleBegin = 0;
     ULONG_PTR moduleEnd = 0;
     if (!SelfModuleRange(moduleBegin, moduleEnd)) return false;
     for (HANDLE thread : frozen.handles) {
+        if (GetTickCount64() >= deadline) return false;
         if (WaitForSingleObject(thread, 0) == WAIT_OBJECT_0) continue;
         CONTEXT context = {};
         context.ContextFlags = CONTEXT_CONTROL;
-        if (!GetThreadContext(thread, &context)) return false;
+        clip::TraceMark(frozen.trace, "thread.context.begin", GetThreadId(thread));
+        const BOOL gotContext = GetThreadContext(thread, &context);
+        clip::TraceMark(frozen.trace, "thread.context.end", gotContext,
+                        gotContext ? ERROR_SUCCESS : GetLastError());
+        if (!gotContext) return false;
 #ifdef _WIN64
         const ULONG_PTR instruction = static_cast<ULONG_PTR>(context.Rip);
 #else
@@ -1736,121 +1833,115 @@ static bool FrozenThreadsOutsideSelf(const FrozenThreads& frozen) noexcept {
     return true;
 }
 
-// Detours 的 new/delete 走本 DLL 静态 CRT 堆。挂起前锁住它，避免宿主
-// 线程停在 Hook 路径的 malloc 里，随后 Commit/Abort 再 delete 死等。
-struct CrtHeapLock {
-    HANDLE heap = nullptr;
-    bool Lock() noexcept {
-        heap = reinterpret_cast<HANDLE>(_get_heap_handle());
-        if (!heap) return false;
-        if (!HeapLock(heap)) {
-            heap = nullptr;
-            return false;
-        }
-        return true;
-    }
-    void Unlock() noexcept {
-        if (!heap) return;
-        HeapUnlock(heap);
-        heap = nullptr;
-    }
-    ~CrtHeapLock() { Unlock(); }
-};
-
-static bool FreezeOtherThreads(FrozenThreads& frozen,
-                               bool requireStableSnapshot = true) noexcept {
-    const DWORD selfPid = GetCurrentProcessId();
+static bool FreezeOtherThreads(FrozenThreads& frozen, clip::ThreadSnapshot& snapshot,
+                               ULONGLONG deadline) noexcept {
+#ifdef CLIP_TEST_EXPORTS
+    g_testFreezeCalls.fetch_add(1, std::memory_order_relaxed);
+#endif
     const DWORD selfTid = GetCurrentThreadId();
     for (int round = 0; round < kFreezeStableRounds; ++round) {
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if (snap == INVALID_HANDLE_VALUE) return false;
-        THREADENTRY32 te = {sizeof(te)};
-        if (!Thread32First(snap, &te)) {
-            CloseHandle(snap);
+        if (GetTickCount64() >= deadline) {
+            clip::TraceMark(frozen.trace, "freeze.deadline", round, ERROR_TIMEOUT);
             return false;
         }
+        if (round != 0) {
+            clip::TraceMark(frozen.trace, "snapshot.refresh.begin", round);
+            const bool refreshed = snapshot.Refresh(deadline);
+            clip::TraceMark(frozen.trace, "snapshot.refresh.end", refreshed);
+            if (!refreshed) return false;
+        }
+        const ULONG count = snapshot.Count();
+        clip::TraceMark(frozen.trace, "freeze.round", count);
         bool grew = false;
-        do {
-            if (te.th32OwnerProcessID != selfPid) continue;
-            if (te.th32ThreadID == selfTid) continue;
-            if (frozen.Contains(te.th32ThreadID)) continue;
-            HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                                           THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
-                                       FALSE, te.th32ThreadID);
-            if (!thread) {
-                if (GetLastError() != ERROR_INVALID_PARAMETER) {
-                    CloseHandle(snap);
-                    return false;
-                }
-                continue;
-            }
-            if (SuspendThread(thread) == (DWORD)-1) {
-                CloseHandle(thread);
-                continue;
-            }
-            if (!frozen.AddSuspended(thread, te.th32ThreadID)) {
-                CloseHandle(snap);
+        for (ULONG index = 0; index < count; ++index) {
+            if (GetTickCount64() >= deadline) {
+                clip::TraceMark(frozen.trace, "freeze.deadline", frozen.handles.size(), ERROR_TIMEOUT);
                 return false;
             }
+            const DWORD tid = snapshot.Id(index);
+            if (tid == selfTid || frozen.Contains(tid)) continue;
+            clip::TraceMark(frozen.trace, "thread.open.begin", tid);
+            HANDLE thread = snapshot.Take(index);
+            clip::TraceMark(frozen.trace, "thread.open.end", tid, thread ? ERROR_SUCCESS : GetLastError());
+            if (!thread) {
+                if (GetLastError() != ERROR_INVALID_PARAMETER) return false;
+                continue;
+            }
+            clip::TraceMark(frozen.trace, "thread.suspend.begin", tid);
+            const DWORD previousCount = SuspendThread(thread);
+            clip::TraceMark(frozen.trace, "thread.suspend.end", tid,
+                            previousCount == DWORD(-1) ? GetLastError() : ERROR_SUCCESS);
+            if (previousCount == (DWORD)-1) {
+                const bool exited = WaitForSingleObject(thread, 0) == WAIT_OBJECT_0;
+                CloseHandle(thread);
+                if (!exited) return false;
+                continue;
+            }
+            if (!frozen.AddSuspended(thread, tid)) return false;
+#ifdef CLIP_TEST_EXPORTS
+            if (g_testAbortFreeze.load() == 1) {
+                g_testAbortFreeze.store(0);
+                return false;
+            }
+#endif
             grew = true;
-        } while (Thread32Next(snap, &te));
-        CloseHandle(snap);
-        if (!requireStableSnapshot) return true;
+        }
         if (!grew) return true;
     }
     return false;
 }
 
-// Detach prevents new API calls from entering this DLL. Existing calls may
-// still be returning through a Hooked_* frame, including a thread stopped in
-// the few instructions before it increments the active-call counter. Freeze
-// and inspect all other instruction pointers before dropping the worker's
-// final module reference.
-static bool WaitForModuleRundown() noexcept {
-    const ULONGLONG deadline = GetTickCount64() + 10000;
-    // 先被动等待在途 Hook 调用返回：此阶段完全不触碰宿主线程。
-    while (g_activeDetourCalls.load(std::memory_order_acquire) != 0 &&
-           GetTickCount64() < deadline)
-        Sleep(15);
-    // 校验轮次固定间隔 250ms、最多 5 轮。旧实现以 1-32ms 间隔反复
-    // “全系统线程快照 + 挂起宿主全部线程 + 读取上下文”，多个宿主同时
-    // 卸载时会让所有程序一起卡顿。拉长间隔不影响安全结论：校验不过时
-    // 仍然返回 false，由调用方保留模块引用（宁可泄漏也不卸载代码页）。
-    for (int pass = 0; pass < 5; ++pass) {
-        bool clear = false;
-        if (g_activeDetourCalls.load(std::memory_order_acquire) == 0) {
-            FrozenThreads frozen;
-            if (frozen.Prepare() && FreezeOtherThreads(frozen, false)) {
-                clear =
-                    g_activeDetourCalls.load(std::memory_order_acquire) == 0 &&
-                    FrozenThreadsOutsideSelf(frozen);
-            }
-        }
-        if (clear) return true;
-        if (GetTickCount64() >= deadline) return false;
-        Sleep(250);
-    }
-    return false;
-}
-
-static bool UpdateAllThreadsForTransaction(const std::vector<HANDLE>& threads) noexcept {
+static bool UpdateAllThreadsForTransaction(const FrozenThreads& frozen,
+                                          ULONGLONG deadline) noexcept {
     if (DetourUpdateThread(GetCurrentThread()) != NO_ERROR) return false;
     g_dbThreads.fetch_add(1);
-    for (HANDLE thread : threads) {
+    for (size_t index = 0; index < frozen.handles.size(); ++index) {
+        HANDLE thread = frozen.handles[index];
+        if (GetTickCount64() >= deadline) {
+            clip::TraceMark(frozen.trace, "enlist.deadline", index, ERROR_TIMEOUT);
+            return false;
+        }
         if (WaitForSingleObject(thread, 0) == WAIT_OBJECT_0) continue;
-        if (DetourUpdateThread(thread) != NO_ERROR) return false;
+        clip::TraceMark(frozen.trace, "thread.enlist.begin", frozen.ids[index]);
+        const LONG result = DetourUpdateThread(thread);
+        clip::TraceMark(frozen.trace, "thread.enlist.end", frozen.ids[index], result);
+        if (result != NO_ERROR) return false;
         g_dbThreads.fetch_add(1);
+#ifdef CLIP_TEST_EXPORTS
+        if (g_testAbortFreeze.load() == 2) {
+            g_testAbortFreeze.store(0);
+            return false;
+        }
+#endif
     }
     return true;
 }
 
-static bool RunDetourTransaction(bool install) noexcept {
+static bool RunDetourTransaction(bool install, clip::ShutdownTrace* trace = nullptr) noexcept {
     FrozenThreads frozen;
-    if (!frozen.Prepare()) return false;
+    frozen.trace = trace;
+    clip::TraceMark(trace, "thread.storage.begin");
+    const bool prepared = frozen.Prepare();
+    clip::TraceMark(trace, "thread.storage.end", prepared);
+    if (!prepared) return false;
+    clip::ThreadSnapshot snapshot;
+    clip::TraceMark(trace, "snapshot.prepare.begin");
+    const bool snapshotReady = snapshot.Prepare();
+    clip::TraceMark(trace, "snapshot.prepare.end", snapshotReady);
+    if (!snapshotReady) return false;
 
+    clip::TraceMark(trace, "transaction.begin.begin");
     const LONG begin = DetourTransactionBegin();
+    clip::TraceMark(trace, "transaction.begin.end", 0, begin);
     if (install) g_dbTxBegin = begin;
-    if (begin != NO_ERROR) return false;
+    if (begin != NO_ERROR) {
+        // Begin may acquire transaction ownership before page protection fails.
+        // Abort releases that ownership; it is harmless for a different owner.
+        clip::TraceMark(trace, "transaction.abort.begin");
+        const LONG aborted = DetourTransactionAbort();
+        clip::TraceMark(trace, "transaction.abort.end", 0, aborted);
+        return false;
+    }
 
     bool opsOk = false;
     if (install) {
@@ -1865,39 +1956,90 @@ static bool RunDetourTransaction(bool install) noexcept {
                 g_dbA1.load() == NO_ERROR &&
                 g_dbA2.load() == NO_ERROR && g_dbA3.load() == NO_ERROR;
     } else {
+        clip::TraceMark(trace, "detach.OpenClipboard.begin");
         LONG openDetach = DetourDetach(&(PVOID&)Real_OpenClipboard,
                                        Hooked_OpenClipboard);
+        clip::TraceMark(trace, "detach.OpenClipboard.end", 0, openDetach);
+        clip::TraceMark(trace, "detach.CloseClipboard.begin");
         LONG closeDetach = DetourDetach(&(PVOID&)Real_CloseClipboard,
                                         Hooked_CloseClipboard);
+        clip::TraceMark(trace, "detach.CloseClipboard.end", 0, closeDetach);
+        clip::TraceMark(trace, "detach.GetClipboardData.begin");
         LONG detach1 = DetourDetach(&(PVOID&)Real_GetClipboardData,
                                     Hooked_GetClipboardData);
+        clip::TraceMark(trace, "detach.GetClipboardData.end", 0, detach1);
+        clip::TraceMark(trace, "detach.SetClipboardData.begin");
         LONG detach2 = DetourDetach(&(PVOID&)Real_SetClipboardData,
                                     Hooked_SetClipboardData);
+        clip::TraceMark(trace, "detach.SetClipboardData.end", 0, detach2);
+        clip::TraceMark(trace, "detach.EmptyClipboard.begin");
         LONG detach3 = DetourDetach(&(PVOID&)Real_EmptyClipboard,
                                     Hooked_EmptyClipboard);
+        clip::TraceMark(trace, "detach.EmptyClipboard.end", 0, detach3);
         opsOk = openDetach == NO_ERROR && closeDetach == NO_ERROR &&
                 detach1 == NO_ERROR &&
                 detach2 == NO_ERROR && detach3 == NO_ERROR;
     }
 
+    clip::TraceMark(trace, "privateclip.stage.begin", install);
     opsOk = privateclip::Attach(install) && opsOk;
+    clip::TraceMark(trace, "privateclip.stage.end", opsOk);
     // Attach/Detach only stage the transaction. Prepare trampolines and
     // decode instructions while the host is still running; freeze only for
     // thread-context updates and the commit that actually patches code.
-    bool froze = false;
-    if (opsOk) {
-        CrtHeapLock crt;
-        if (crt.Lock()) {
-            froze = FreezeOtherThreads(frozen);
-            crt.Unlock();
-        }
-    }
+    LARGE_INTEGER started{}, frequency{}, finished{};
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&started);
+    const ULONGLONG deadline = GetTickCount64() + kFreezeBudgetMs;
+    clip::TraceMark(trace, "freeze.begin");
+    const bool froze = opsOk && FreezeOtherThreads(frozen, snapshot, deadline);
+    clip::TraceMark(trace, "freeze.end", froze);
+    clip::TraceMark(trace, "enlist.begin", frozen.handles.size());
     const bool updateOk = opsOk && froze &&
-                          UpdateAllThreadsForTransaction(frozen.handles);
+                          UpdateAllThreadsForTransaction(frozen, deadline) &&
+                          GetTickCount64() < deadline;
+    clip::TraceMark(trace, "enlist.end", updateOk);
+    if (install && updateOk)
+        g_moduleSafeToRelease.store(false, std::memory_order_release);
+    clip::TraceMark(trace, updateOk ? "transaction.commit.begin" : "transaction.abort.begin");
     const LONG result = updateOk ? DetourTransactionCommit() : DetourTransactionAbort();
-    if (install) g_dbCommit = result;
+    clip::TraceMark(trace, updateOk ? "transaction.commit.end" : "transaction.abort.end", 0, result);
+    if (install) g_dbCommit = updateOk ? result : ERROR_OPERATION_ABORTED;
+    if (!install && updateOk && result == NO_ERROR) {
+        // Commit releases Detours' suspension, but our outer suspension still
+        // holds every enlisted thread. Check once here, before resuming them.
+        // A zero call count alone misses Hook entry/return instructions.
+        clip::TraceMark(trace, "module.check.begin", g_activeDetourCalls.load());
+        g_moduleSafeToRelease.store(
+            g_activeDetourCalls.load(std::memory_order_acquire) == 0 &&
+                FrozenThreadsOutsideSelf(frozen, deadline),
+            std::memory_order_release);
+        clip::TraceMark(trace, "module.check.end", g_moduleSafeToRelease.load());
+    }
+    clip::TraceMark(trace, "thaw.begin", frozen.handles.size());
+    frozen.ThawAndClose();
+    clip::TraceMark(trace, "thaw.end");
+    QueryPerformanceCounter(&finished);
+    const ULONGLONG micros = frequency.QuadPart > 0
+        ? (finished.QuadPart - started.QuadPart) * 1000000 / frequency.QuadPart : 0;
+    g_lastFreezeMicros.store(micros, std::memory_order_release);
+    clip::TraceMark(trace, "transaction.finish.freeze_us", micros);
     return updateOk && result == NO_ERROR;
 }
+
+#ifdef CLIP_TEST_EXPORTS
+extern "C" __declspec(dllexport) ULONGLONG ClipHookFreezeMicrosForTest() {
+    return g_lastFreezeMicros.load(std::memory_order_acquire);
+}
+extern "C" __declspec(dllexport) BOOL ClipHookAbortFreezeForTest(DWORD phase) {
+    g_testAbortFreeze.store(phase);
+    const bool committed = RunDetourTransaction(true);
+    return !committed && g_testAbortFreeze.exchange(0) == 0;
+}
+extern "C" __declspec(dllexport) void ClipHookAbortNextDetachForTest() {
+    g_testAbortFreeze.store(1);
+}
+#endif
 
 static bool InstallHooks() {
     privateclip::Initialize(&g_activeDetourCalls);
@@ -1907,22 +2049,47 @@ static bool InstallHooks() {
     return ok;
 }
 
-static bool RemoveHooks() {
-    if (!privateclip::CanDetach()) return false;
-    if (!g_hooksInstalled.load(std::memory_order_acquire)) return true;
-    bool ok = RunDetourTransaction(false);
+static bool RemoveHooks(clip::ShutdownTrace* trace = nullptr) {
+    clip::ShutdownTrace localTrace;
+    if (!trace) {
+        localTrace.Open(L"hook", g_self);
+        trace = &localTrace;
+    }
+    trace->Mark("remove.begin", g_hooksInstalled.load());
+    trace->Mark("privateclip.can_detach.begin");
+    const bool canDetach = privateclip::CanDetach();
+    trace->Mark("privateclip.can_detach.end", canDetach);
+    if (!canDetach) { trace->Mark("remove.retained.privateclip"); return false; }
+    if (!g_hooksInstalled.load(std::memory_order_acquire)) {
+        trace->Mark("remove.already_detached");
+        return true;
+    }
+    bool ok = RunDetourTransaction(false, trace);
     if (ok) g_hooksInstalled.store(false, std::memory_order_release);
+    trace->Mark("remove.end", ok);
     return ok;
 }
 
-static HMODULE PrepareWorkerExit(bool allowRestart) noexcept {
+static HMODULE PrepareWorkerExit(bool allowRestart, clip::ShutdownTrace* trace) noexcept {
+    clip::TraceMark(trace, "controller_signals.close.begin");
     CloseControllerSignals();
+    clip::TraceMark(trace, "controller_signals.close.end");
+    HMODULE workerModule = nullptr;
+    if (g_moduleSafeToRelease.load(std::memory_order_acquire))
+        workerModule = g_workerModule.exchange(nullptr, std::memory_order_acq_rel);
+    clip::TraceMark(trace, workerModule ? "worker.module_release.next" : "worker.module_retained");
+    // ExitThread/FreeLibraryAndExitThread do not unwind the caller's stack.
+    if (trace) trace->Close();
+    // Otherwise retain one reference for in-flight returns. A later worker
+    // reuses it and can release it after a quiescent detach transaction.
     if (allowRestart) g_workerStarted.store(false, std::memory_order_release);
-    HMODULE workerModule =
-        g_workerModule.exchange(nullptr, std::memory_order_acq_rel);
     // Publish workerRunning last. A concurrent reinjection can now start only
-    // after the old handles are closed and must acquire its own module ref.
+    // after the old handles are closed and the module reference is settled.
     g_workerRunning.store(0, std::memory_order_release);
+#ifdef CLIP_TEST_EXPORTS
+    if (HANDLE stopped = g_testWorkerStoppedEvent.load(std::memory_order_acquire))
+        SetEvent(stopped);
+#endif
     return workerModule;
 }
 
@@ -1931,14 +2098,22 @@ static HMODULE PrepareWorkerExit(bool allowRestart) noexcept {
     ExitThread(0);
 }
 
-[[noreturn]] static void WorkerExit(bool allowRestart,
-                                    bool rundownComplete = false) {
-    if (!rundownComplete && !WaitForModuleRundown()) {
-        CloseControllerSignals();
-        g_workerRunning.store(0, std::memory_order_release);
-        ExitThread(0);
+[[noreturn]] static void WorkerExit(bool allowRestart, clip::ShutdownTrace* trace = nullptr) {
+    // Detach/ACK and pipe cancellation are already complete. Keep shared maps
+    // and controller handles valid until old calls stop using them; waiting
+    // here never suspends the host or delays the controller's shutdown ACK.
+    clip::TraceMark(trace, "rundown.begin", g_activeDetourCalls.load());
+    ULONGLONG nextReport = GetTickCount64() + 1000;
+    for (DWORD delay = 1; g_activeDetourCalls.load(std::memory_order_acquire) != 0;
+         delay = (std::min)(delay * 2, DWORD{250})) {
+        Sleep(delay);
+        if (GetTickCount64() >= nextReport) {
+            clip::TraceMark(trace, "rundown.waiting", g_activeDetourCalls.load());
+            nextReport = GetTickCount64() + 1000;
+        }
     }
-    FinishWorkerExit(PrepareWorkerExit(allowRestart));
+    clip::TraceMark(trace, "rundown.end");
+    FinishWorkerExit(PrepareWorkerExit(allowRestart, trace));
 }
 
 static DWORD PipeThreadBody() {
@@ -1946,12 +2121,15 @@ static DWORD PipeThreadBody() {
     g_workerRunning.store(1, std::memory_order_release);
     if (WaitForStop(0)) WorkerExit(true);
     PrepareProcessIdentity();
-    OpenSourceMapping();
-    OpenCryptoMapping();
-    if (!InstallHooks()) {
-        WorkerExit(false);
-        return 0;
+    // Standalone regression hosts provide explicit lifetime signals. Normal
+    // workers bind to the authenticated controller before installing Detours.
+#ifdef CLIP_TEST_EXPORTS
+    if (g_stopEvent) {
+        OpenSourceMapping();
+        OpenCryptoMapping();
+        if (!InstallHooks()) { WorkerExit(false); return 0; }
     }
+#endif
 
     while (!WaitForStop(0)) {
         privateclip::Poll();
@@ -1962,10 +2140,15 @@ static DWORD PipeThreadBody() {
                 WaitForStop(2000);
                 continue;
             }
-            if (!IsTrustedPipeServer(pipe)) {
+            if (!BindPipeServer(pipe)) {
                 CloseHandle(pipe);
                 WaitForStop(2000);
                 continue;
+            }
+            if (!InstallHooks()) {
+                CloseHandle(pipe);
+                WorkerExit(false);
+                return 0;
             }
             EnterCriticalSection(&g_pipeCs);
             g_pipe = pipe;
@@ -2044,32 +2227,41 @@ static DWORD PipeThreadBody() {
 
     bool shutdownRequested = g_shutdownRequested.exchange(false,
                                                            std::memory_order_acq_rel);
+    clip::ShutdownTrace trace;
+    trace.Open(L"hook", g_self);
+    trace.Mark("shutdown.begin", shutdownRequested);
     g_connected.store(false, std::memory_order_release);
-    bool hooksRemoved = RemoveHooks();
-    const bool rundownOk = !hooksRemoved || WaitForModuleRundown();
-    HMODULE exitingModule = nullptr;
-    if (hooksRemoved && shutdownRequested && rundownOk)
-        exitingModule = PrepareWorkerExit(false);
-    // A shutdown ACK proves fail-open, successful Detour removal, and that no
-    // target thread can still return through this module's code pages. The
-    // old worker state is published before ACK so immediate reinjection must
-    // acquire a new module reference instead of racing this thread's release.
-    if (shutdownRequested && hooksRemoved && rundownOk &&
-        g_pipe != INVALID_HANDLE_VALUE) {
+    trace.Mark("confirmations.cancel.begin");
+    CancelConfirmations();
+    trace.Mark("confirmations.cancel.end");
+    bool hooksRemoved = RemoveHooks(&trace);
+    // ACK proves fail-open and successful Detour removal. Code pages remain
+    // referenced if a thread could still return through them; there is no
+    // second suspension or retry loop solely to force a module unload.
+    if (shutdownRequested && g_pipe != INVALID_HANDLE_VALUE) {
+        trace.Mark("shutdown_ack.begin");
         std::string ack;
-        clip::PutFrame(ack, clip::kIpcShutdownAck);
-        (void)SendAll(ack);
+        clip::PutFrame(ack, hooksRemoved ? clip::kIpcShutdownAck : clip::kIpcShutdownRetained);
+        const bool sent = SendAll(ack);
+        trace.Mark(hooksRemoved ? "shutdown_ack.end" : "shutdown_retained_ack.end", sent);
     }
+    trace.Mark("pipe.close.begin");
     ClosePipe();
+    trace.Mark("pipe.close.end");
     // A controller-initiated shutdown is terminal for this injected module;
     // allowing EnsureWorker to restart between ACK and stop-event propagation
     // would invalidate the ACK's lifecycle guarantee.
-    if (hooksRemoved && rundownOk) {
-        if (shutdownRequested) FinishWorkerExit(exitingModule);
-        WorkerExit(true, true);
+    if (hooksRemoved) {
+#ifdef CLIP_TEST_EXPORTS
+        if (HANDLE detached = g_testDetachedEvent.load(std::memory_order_acquire))
+            SetEvent(detached);
+#endif
+        WorkerExit(!shutdownRequested, &trace);
     }
 
     // 无法安全移除 Detours 时保留模块引用，宁可泄漏到进程退出也不卸载代码页。
+    trace.Mark("shutdown.retained");
+    trace.Close();
     g_workerRunning.store(0, std::memory_order_release);
     return 0;
 }
@@ -2101,7 +2293,6 @@ static DWORD WINAPI PipeThread(LPVOID) {
             __try {
                 bool removed = RemoveHooks();
                 ClosePipe();
-                CloseControllerSignals();
                 if (removed) {
                     g_hooksInstalled.store(false, std::memory_order_release);
                     WorkerExit(false);
@@ -2118,7 +2309,7 @@ static DWORD WINAPI PipeThread(LPVOID) {
         if (recovery) {
             CloseHandle(recovery);
         } else {
-            CloseControllerSignals();
+            // In-flight calls may still use the shared mappings and handles.
             g_workerRunning.store(0, std::memory_order_release);
         }
         return GetExceptionCode();
@@ -2209,7 +2400,9 @@ static bool ConfirmAccess(const clip::RuleMatch& match, clip::ClipOp operation,
     bool queued = false;
     EnterCriticalSection(&g_confirmationCs);
     try {
-        if (g_confirmationQueue.size() < kConfirmationQueueCapacity) {
+        if (g_connected.load(std::memory_order_acquire) &&
+            !g_stop.load(std::memory_order_acquire) &&
+            g_confirmationQueue.size() < kConfirmationQueueCapacity) {
             g_confirmationWaiters.emplace(token, &waiter);
             try {
                 g_confirmationQueue.push_back(std::move(request));
@@ -2750,17 +2943,18 @@ static void EnsureWorker(bool explicitStart) {
     bool expected = false;
     if (!g_workerStarted.compare_exchange_strong(expected, true)) return;
 
-    std::wstring stopEventName =
-        clip::ResolveObjectName(L"CLIP_TEST_STOP_EVENT", clip::kStopEventName);
+    const std::wstring stopEventName =
+        clip::ResolveObjectName(L"CLIP_TEST_STOP_EVENT", L"");
     std::wstring controllerMutexName =
         clip::ResolveObjectName(L"CLIP_TEST_CONTROLLER_MUTEX",
                                 clip::kSingleInstanceMutexName);
     g_pipeName = clip::ResolveObjectName(L"CLIP_TEST_PIPE_NAME",
                                          clip::kPipeName);
-    g_stopEvent = OpenEventW(SYNCHRONIZE, FALSE, stopEventName.c_str());
+    g_stopEvent = stopEventName.empty() ? nullptr :
+        OpenEventW(SYNCHRONIZE, FALSE, stopEventName.c_str());
     g_controllerMutex = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE,
                                    controllerMutexName.c_str());
-    if (!g_stopEvent || !g_controllerMutex) {
+    if (!g_controllerMutex || (!stopEventName.empty() && !g_stopEvent)) {
         // Injection is only valid while the controller owns both lifetime
         // signals. Do not install Detours when that owner is already gone.
         CloseControllerSignals();
@@ -2831,6 +3025,7 @@ void ClipHookStartForTest() {
 
 extern "C"
 LRESULT CALLBACK GetMsgProc(int code, WPARAM wp, LPARAM lp) {
+    if (code < 0 || g_isSelf) return CallNextHookEx(nullptr, code, wp, lp);
     bool explicitStart = false;
     if (code >= 0 && lp) {
         const auto* message = reinterpret_cast<const MSG*>(lp);
