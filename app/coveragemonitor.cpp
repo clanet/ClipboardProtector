@@ -353,7 +353,14 @@ void CoverageMonitor::Scan() {
     for (size_t index = 0; index < count; ++index) {
         if (WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0) break;
         Entry& entry = *candidates[index];
-        const bool retainedReference = StartTarget(entry);
+        // 已有未平衡的引用（例如冻结进程里超时的 LoadLibrary）时只尝试启动已加载的模块，
+        // 不再每次退避重试都追加远程线程和缓冲区；十分钟后仍未加载则视为上次加载
+        // 已失败，允许重新加载一次，避免该进程永久失去覆盖。
+        constexpr ULONGLONG kReloadAfterRetainedMs = 10ull * 60 * 1000;
+        const bool allowLoad = !entry.retainedReference ||
+            GetTickCount64() - entry.retainedSince >= kReloadAfterRetainedMs;
+        const bool retainedReference = StartTarget(entry, allowLoad);
+        if (retainedReference && allowLoad) entry.retainedSince = GetTickCount64();
         if (retainedReference && !entry.retainedReference) {
             entry.retainedReference = true;
             entry.releaseAttempts = 0;
@@ -365,18 +372,19 @@ void CoverageMonitor::Scan() {
     }
 }
 
-bool CoverageMonitor::StartTarget(const Entry& entry) {
+bool CoverageMonitor::StartTarget(const Entry& entry, bool allowLoad) {
 #ifdef _WIN64
     if (entry.architecture == Architecture::x86) {
         DWORD exitCode = kRemoteHelperFailed;
-        if (!Run32BitHelper(L"--remote-start", entry, exitCode))
+        if (!Run32BitHelper(allowLoad ? L"--remote-start" : L"--remote-start-loaded",
+                            entry, exitCode))
             return exitCode == WAIT_TIMEOUT;
         return exitCode == kRemoteHelperStartedRetained ||
                exitCode == kRemoteHelperFailedRetained;
     }
 #endif
     const RemoteHookStartResult result = RemoteHookStart(
-        entry.processId, entry.creationTime, nativeDllPath_);
+        entry.processId, entry.creationTime, nativeDllPath_, allowLoad);
     return result.retainedReference;
 }
 

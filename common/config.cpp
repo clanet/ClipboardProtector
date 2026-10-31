@@ -156,9 +156,19 @@ Config MakeFirstRunConfig(Language language) {
 }
 
 bool Config::Load(const std::wstring& path) {
+    // 存在却无法使用的文件先移为 .bak，避免之后保存默认配置时覆盖用户原文件。
+    // 移动失败时原文件仍在原处，由调用方决定是否继续。
+    const auto backup = [&path] {
+        MoveFileExW(path.c_str(), (path + L".bak").c_str(),
+                    MOVEFILE_REPLACE_EXISTING);
+        return false;
+    };
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;   // 首次运行：文件不存在
+    if (h == INVALID_HANDLE_VALUE) {
+        // 首次运行：文件不存在；其他错误（拒绝访问、共享冲突）同样先尝试备份。
+        return GetLastError() == ERROR_FILE_NOT_FOUND ? false : backup();
+    }
 
     // 读全文（配置很小，一次读完）
     std::string utf8;
@@ -178,28 +188,23 @@ bool Config::Load(const std::wstring& path) {
         }
     }
     CloseHandle(h);
-    if (!readOk) return false;
+    if (!readOk) return backup();
 
     // UTF-8 -> UTF-16
     int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
                                    utf8.data(), (int)utf8.size(), nullptr, 0);
-    if (wlen <= 0) return false;
+    if (wlen <= 0) return backup();
     std::wstring text(wlen, L'\0');
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
                             utf8.data(), (int)utf8.size(), &text[0], wlen) != wlen)
-        return false;
+        return backup();
 
     // 容忍 BOM
     if (!text.empty() && text.front() == L'\uFEFF') text.erase(0, 1);
 
     minjson::Value root = minjson::Parse(text);
     bool ok = root.type() == minjson::Value::T::Obj;
-    if (!ok) {
-        // 损坏：备份后重建默认
-        MoveFileExW(path.c_str(), (path + L".bak").c_str(),
-                    MOVEFILE_REPLACE_EXISTING);
-        return false;
-    }
+    if (!ok) return backup();   // 损坏：备份，由调用方改用默认配置
 
     const int ruleModelVersion = static_cast<int>(
         root.get(L"ruleModelVersion").asInt(0));
@@ -270,11 +275,8 @@ bool Config::Load(const std::wstring& path) {
     if (!rulesValue.isNull()) {
         std::vector<Rule> parsedRules;
         if (!RulesFromJson(rulesValue, ruleModelVersion, parsedRules) ||
-            !IsRuleSetSupported(parsedRules)) {
-            MoveFileExW(path.c_str(), (path + L".bak").c_str(),
-                        MOVEFILE_REPLACE_EXISTING);
-            return false;
-        }
+            !IsRuleSetSupported(parsedRules))
+            return backup();
         loadedRules = std::move(parsedRules);
     }
     settings = std::move(loadedSettings);

@@ -214,6 +214,14 @@ static bool ParseEvent(const char* data, size_t size, size_t& consumed,
           reader.GetWStr(sourceName) && reader.GetWStr(sourcePath) &&
           reader.GetWStr(ruleName)))
         return false;
+    // 与确认请求一致地限制名称长度（路径已由 GetWStr 限制在 32768），
+    // 避免单个事件把日志内存放大数百倍；截断时不拆开代理对。
+    const auto truncate = [](std::wstring& text, size_t limit) {
+        if (text.size() > limit)
+            text.resize(IS_HIGH_SURROGATE(text[limit - 1]) ? limit - 1 : limit);
+    };
+    truncate(sourceName, 260);
+    truncate(ruleName, 128);
     if (reader.n != 0 && !reader.GetU64(missingEvents)) return false;
     if (reader.n != 0 && logVisibilityAllowed &&
         (!reader.GetU8(hideFromLogList) || hideFromLogList > 1))

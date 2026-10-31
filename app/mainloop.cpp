@@ -622,6 +622,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         return 1;
     }
     g_app.cfgPath = configDir + L"\\config.json";
+    bool configLoadFailed = false;
     if (GetFileAttributesW(g_app.cfgPath.c_str()) == INVALID_FILE_ATTRIBUTES &&
         GetLastError() == ERROR_FILE_NOT_FOUND) {
         g_app.cfg = MakeFirstRunConfig(SystemLanguage());
@@ -630,10 +631,22 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
                          UiText(TextId::ClipboardProtector), MB_ICONERROR);
             return 1;
         }
-    } else {
-        g_app.cfg.Load(g_app.cfgPath);
+    } else if (!g_app.cfg.Load(g_app.cfgPath)) {
+        // Load 会把无法使用的原文件移为 .bak。移动失败时原文件仍在：继续运行会在
+        // 之后的自动保存中用默认配置覆盖它，因此提示后退出。
+        if (GetFileAttributesW(g_app.cfgPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            UiMessageBox(nullptr, UiText(TextId::CouldNotLoadOrBackUpConfiguration),
+                         UiText(TextId::ClipboardProtector), MB_ICONERROR);
+            return 1;
+        }
+        // 不能静默以空规则运行。
+        g_app.cfg = MakeFirstRunConfig(SystemLanguage());
+        configLoadFailed = true;
     }
     SetLanguage(g_app.cfg.settings.language);
+    if (configLoadFailed)
+        UiMessageBox(nullptr, UiText(TextId::CouldNotLoadConfigurationDefaultsUsed),
+                     UiText(TextId::ClipboardProtector), MB_ICONWARNING);
     if (!CreateMainWindow()) return 1;
     RunMessageLoop();
 

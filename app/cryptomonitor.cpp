@@ -35,20 +35,22 @@ bool SystemClipboardReader::Read(std::wstring& text, DWORD& sequence) {
         HANDLE memory = GetClipboardData(CF_UNICODETEXT);
         if (!memory) return false;
         const SIZE_T bytes = GlobalSize(memory);
-        if (bytes < sizeof(wchar_t) || bytes % sizeof(wchar_t) != 0) return false;
+        if (bytes < sizeof(wchar_t)) return false;
         const auto* data = static_cast<const wchar_t*>(GlobalLock(memory));
         if (!data) return false;
+        // 奇数长度向下取整、没有终止符的超长文本只取前缀比较：直接判定读取失败
+        // 会让基线停在旧地址，构造的写入就能躲过变化提醒。
         const size_t capacity = (std::min)(static_cast<size_t>(bytes / sizeof(wchar_t)),
-                                           kMaxCryptoTextLength + 1);
+                                           kMaxCryptoTextLength);
         const auto* end = std::find(data, data + capacity, L'\0');
-        bool complete = end != data + capacity;
+        bool copied = true;
         try {
-            if (complete) text.assign(data, end);
+            text.assign(data, end);
         } catch (...) {
-            complete = false;
+            copied = false;
         }
         GlobalUnlock(memory);
-        if (!complete) return false;
+        if (!copied) return false;
     }
     sequence = GetClipboardSequenceNumber();
     // Delayed rendering can change the sequence even while the clipboard is

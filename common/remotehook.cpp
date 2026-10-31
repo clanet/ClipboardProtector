@@ -296,7 +296,8 @@ bool ReleaseOneReference(HANDLE process,
 
 RemoteHookStartResult RemoteHookStart(DWORD processId,
                                       ULONGLONG expectedCreationTime,
-                                      const std::wstring& dllPath) {
+                                      const std::wstring& dllPath,
+                                      bool allowLoad) {
     RemoteHookStartResult result;
     if (processId == 0 || expectedCreationTime == 0 || dllPath.empty()) {
         result.error = ERROR_INVALID_PARAMETER;
@@ -329,6 +330,12 @@ RemoteHookStartResult RemoteHookStart(DWORD processId,
     bool addedReference = false;
 
     if (!remoteModule) {
+        if (!allowLoad) {
+            // 上次超时的加载仍可能完成，引用继续按保留处理。
+            result.error = WAIT_TIMEOUT;
+            result.retainedReference = true;
+            return result;
+        }
         RemoteFunction loadLibrary;
         LPTHREAD_START_ROUTINE remoteLoad = nullptr;
         if (!ResolveSystemFunction("LoadLibraryW", loadLibrary) ||

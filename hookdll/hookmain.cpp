@@ -36,6 +36,9 @@ static std::atomic<bool> g_hooksInstalled{false};
 static std::atomic<bool> g_connected{false};
 static std::atomic<LONG> g_workerRunning{0};
 static std::atomic<LONG> g_activeDetourCalls{0};
+// privateclip 的消息分发钩子会覆盖整个窗口过程（含模态循环），只用于判断模块能否释放，
+// 不参与 worker 退出时的 rundown 等待。
+static std::atomic<LONG> g_activePrivateCalls{0};
 static std::atomic<bool> g_stop{false};
 
 static std::atomic<bool> g_workerStarted{false};
@@ -47,22 +50,22 @@ static HANDLE g_controllerProcess = nullptr;
 static DWORD g_controllerPid = 0;
 static ULONGLONG g_controllerCreated = 0;
 static HANDLE g_sourceMapping = nullptr;
-static clip::SharedClipboardSource* g_source = nullptr;
+static std::atomic<clip::SharedClipboardSource*> g_source{nullptr};
 static HANDLE g_cryptoMapping = nullptr;
-static clip::SharedCryptoProtection* g_crypto = nullptr;
+static std::atomic<clip::SharedCryptoProtection*> g_crypto{nullptr};
 static std::wstring g_pipeName;
 static CRITICAL_SECTION g_pipeCs;
+static CRITICAL_SECTION g_workerStartCs;
 static bool g_pipeCsInitialized = false;
 static std::string g_controlInput;
 static ULONGLONG g_controlPartialSince = 0;
 static std::atomic<bool> g_shutdownRequested{false};
 
 // ---- 规则快照与暂停状态 ----
-static CRITICAL_SECTION g_cs;
 static std::shared_ptr<const std::vector<clip::RuleLite>> g_rules;
-static bool g_paused = false;
-static bool g_previewEnabled = false;
-static bool g_shortcutOnlyMode = false;
+static std::atomic<bool> g_paused{false};
+static std::atomic<bool> g_previewEnabled{false};
+static std::atomic<bool> g_shortcutOnlyMode{false};
 static std::atomic<bool> g_shortcutDirectAllow{false};
 static std::atomic<DWORD> g_shortcutAuthorizationWindowMs{
     clip::kDefaultShortcutAuthorizationWindowMs};
@@ -162,8 +165,14 @@ static decltype(&SetClipboardData) Real_SetClipboardData = SetClipboardData;
 static decltype(&EmptyClipboard) Real_EmptyClipboard = EmptyClipboard;
 static thread_local bool g_clipboardModified = false;
 // Keep the baseline across EmptyClipboard -> SetClipboardData. A clear without
-// a subsequent text write retires it before CloseClipboard releases the lock.
+// a subsequent text write (or delayed-render text placeholder) retires it
+// before CloseClipboard releases the lock.
 static thread_local bool g_cryptoClearPending = false;
+// 本线程当前剪贴板会话是否尝试过 EmptyClipboard（含被拦截）；Open/Close 时复位。
+static thread_local bool g_clipboardEmptied = false;
+// 在复制快捷键授权窗口内清空剪贴板时的所有者窗口。绑定窗口而非布尔值：
+// 其他窗口（如经 NtUserEmptyClipboard 绕过钩子的 Edit）取得所有权后不会继承授权。
+static std::atomic<HWND> g_userOwnerWindow{nullptr};
 static thread_local bool g_controlKeyDown = false;
 static thread_local ULONGLONG g_controlKeyDownSince = 0;
 static thread_local bool g_shiftKeyDown = false;
@@ -204,6 +213,8 @@ static bool IsSelfProcess() noexcept {
 }
 
 static void PrepareProcessIdentity() {
+    // 只计算一次：worker 重启时 Detours 可能仍安装着，其他线程正在读取这两个字符串。
+    if (!g_processPathLower.empty()) return;
     std::wstring path;
     if (!clip::ModulePath(nullptr, path)) {
         g_processPathLower.clear();
@@ -217,11 +228,25 @@ static void PrepareProcessIdentity() {
                              : g_processPathLower.substr(pos + 1);
 }
 
-static void CloseSourceMapping() noexcept {
-    if (g_source) {
-        UnmapViewOfFile(g_source);
-        g_source = nullptr;
+// 钩子仍安装时，调用方可能已经拿到旧视图指针。先留着，等拆钩并完成 rundown 再释放。
+static void* g_retiredViews[8] = {};
+static size_t g_retiredViewsCount = 0;
+
+static void ReleaseMappedView(void* view) noexcept {
+    if (g_hooksInstalled.load(std::memory_order_acquire)) {
+        if (view && g_retiredViewsCount < 8)
+            g_retiredViews[g_retiredViewsCount++] = view;
+        return;
     }
+    if (view) UnmapViewOfFile(view);
+    for (size_t index = 0; index < g_retiredViewsCount; ++index)
+        UnmapViewOfFile(g_retiredViews[index]);
+    g_retiredViewsCount = 0;
+}
+
+static void CloseSourceMapping() noexcept {
+    auto* view = g_source.exchange(nullptr, std::memory_order_acq_rel);
+    ReleaseMappedView(view);
     if (g_sourceMapping) {
         CloseHandle(g_sourceMapping);
         g_sourceMapping = nullptr;
@@ -237,17 +262,20 @@ static void OpenSourceMapping() {
     g_sourceMapping = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE,
                                        name.c_str());
     if (!g_sourceMapping) return;
-    g_source = static_cast<clip::SharedClipboardSource*>(
+    auto* view = static_cast<clip::SharedClipboardSource*>(
         MapViewOfFile(g_sourceMapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
                       sizeof(clip::SharedClipboardSource)));
-    if (!g_source) CloseSourceMapping();
+    if (!view) {
+        CloseHandle(g_sourceMapping);
+        g_sourceMapping = nullptr;
+        return;
+    }
+    g_source.store(view, std::memory_order_release);
 }
 
 static void CloseCryptoMapping() noexcept {
-    if (g_crypto) {
-        UnmapViewOfFile(g_crypto);
-        g_crypto = nullptr;
-    }
+    auto* view = g_crypto.exchange(nullptr, std::memory_order_acq_rel);
+    ReleaseMappedView(view);
     if (g_cryptoMapping) {
         CloseHandle(g_cryptoMapping);
         g_cryptoMapping = nullptr;
@@ -263,10 +291,15 @@ static void OpenCryptoMapping() {
     g_cryptoMapping = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE,
                                        name.c_str());
     if (!g_cryptoMapping) return;
-    g_crypto = static_cast<clip::SharedCryptoProtection*>(
+    auto* view = static_cast<clip::SharedCryptoProtection*>(
         MapViewOfFile(g_cryptoMapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
                       sizeof(clip::SharedCryptoProtection)));
-    if (!g_crypto) CloseCryptoMapping();
+    if (!view) {
+        CloseHandle(g_cryptoMapping);
+        g_cryptoMapping = nullptr;
+        return;
+    }
+    g_crypto.store(view, std::memory_order_release);
 }
 
 struct CryptoSnapshot {
@@ -275,23 +308,28 @@ struct CryptoSnapshot {
 
 enum class CryptoLookup { off, inactive, active, unavailable };
 
-static bool LockCryptoState();
-static void UnlockCryptoState();
+static bool LockCryptoState(clip::SharedCryptoProtection* crypto);
+static void UnlockCryptoState(clip::SharedCryptoProtection* crypto);
 
 static bool CryptoFeatureEnabled() {
     if (g_cryptoSettingKnown.load(std::memory_order_acquire))
         return g_cryptoEnabled.load(std::memory_order_acquire);
-    return g_crypto && InterlockedCompareExchange(&g_crypto->enabled, 0, 0) != 0;
+    auto* crypto = g_crypto.load(std::memory_order_acquire);
+    return crypto && InterlockedCompareExchange(&crypto->enabled, 0, 0) != 0;
 }
 
 static CryptoLookup ReadCryptoSnapshot(CryptoSnapshot& snapshot) {
     snapshot = {};
-    if (!CryptoFeatureEnabled()) return CryptoLookup::off;
     // Allocate before acquiring the shared spin lock.
     auto copy = std::make_unique<clip::SharedCryptoProtection>();
-    if (!g_crypto || !LockCryptoState()) return CryptoLookup::unavailable;
-    memcpy(copy.get(), g_crypto, sizeof(*copy));
-    UnlockCryptoState();
+    auto* crypto = g_crypto.load(std::memory_order_acquire);
+    const bool enabled = g_cryptoSettingKnown.load(std::memory_order_acquire)
+        ? g_cryptoEnabled.load(std::memory_order_acquire)
+        : crypto && InterlockedCompareExchange(&crypto->enabled, 0, 0) != 0;
+    if (!enabled) return CryptoLookup::off;
+    if (!crypto || !LockCryptoState(crypto)) return CryptoLookup::unavailable;
+    memcpy(copy.get(), crypto, sizeof(*crypto));
+    UnlockCryptoState(crypto);
     if (copy->structureVersion != clip::kCryptoProtectionVersion ||
         copy->addressCount > clip::kMaxProtectedCryptoAddresses)
         return CryptoLookup::unavailable;
@@ -311,54 +349,59 @@ static CryptoLookup ReadCryptoSnapshot(CryptoSnapshot& snapshot) {
 }
 
 
-static bool LockCryptoState() {
-    if (!g_crypto) return false;
+static bool LockCryptoState(clip::SharedCryptoProtection* crypto) {
+    if (!crypto) return false;
     for (int attempt = 0; attempt < 64; ++attempt) {
-        if (InterlockedCompareExchange(&g_crypto->guard, 1, 0) == 0)
+        if (InterlockedCompareExchange(&crypto->guard, 1, 0) == 0)
             return true;
         YieldProcessor();
     }
     return false;
 }
 
-static void UnlockCryptoState() {
+static void UnlockCryptoState(clip::SharedCryptoProtection* crypto) {
     MemoryBarrier();
-    InterlockedExchange(&g_crypto->guard, 0);
+    InterlockedExchange(&crypto->guard, 0);
 }
 
 static void ClearCryptoAddress() {
-    if (!LockCryptoState()) return;
-    g_crypto->active = 0;
-    g_crypto->addressCount = 0;
-    g_crypto->writerProcessId = 0;
-    g_crypto->clipboardSequence = 0;
-    g_crypto->reserved = 0;
-    g_crypto->expiresAt = 0;
-    ZeroMemory(g_crypto->addresses, sizeof(g_crypto->addresses));
-    UnlockCryptoState();
+    auto* crypto = g_crypto.load(std::memory_order_acquire);
+    if (!LockCryptoState(crypto)) return;
+    crypto->active = 0;
+    crypto->addressCount = 0;
+    crypto->writerProcessId = 0;
+    crypto->clipboardSequence = 0;
+    crypto->reserved = 0;
+    crypto->expiresAt = 0;
+    ZeroMemory(crypto->addresses, sizeof(crypto->addresses));
+    UnlockCryptoState(crypto);
 }
 
 static void PublishCryptoAddress(const std::vector<clip::CryptoAddress>& addresses,
                                  DWORD sequence) {
     constexpr ULONGLONG kProtectionWindowMs = 5ull * 60ull * 1000ull;
-    if (!g_crypto || addresses.empty() ||
+    auto* crypto = g_crypto.load(std::memory_order_acquire);
+    const bool enabled = g_cryptoSettingKnown.load(std::memory_order_acquire)
+        ? g_cryptoEnabled.load(std::memory_order_acquire)
+        : crypto && InterlockedCompareExchange(&crypto->enabled, 0, 0) != 0;
+    if (!crypto || addresses.empty() ||
         addresses.size() > clip::kMaxProtectedCryptoAddresses ||
-        !CryptoFeatureEnabled() || !LockCryptoState()) return;
-    g_crypto->structureVersion = clip::kCryptoProtectionVersion;
-    g_crypto->active = 1;
-    g_crypto->addressCount = static_cast<DWORD>(addresses.size());
-    g_crypto->writerProcessId = GetCurrentProcessId();
-    g_crypto->clipboardSequence = sequence;
-    g_crypto->reserved = 0;
-    g_crypto->expiresAt = GetTickCount64() + kProtectionWindowMs;
-    ZeroMemory(g_crypto->addresses, sizeof(g_crypto->addresses));
+        !enabled || !LockCryptoState(crypto)) return;
+    crypto->structureVersion = clip::kCryptoProtectionVersion;
+    crypto->active = 1;
+    crypto->addressCount = static_cast<DWORD>(addresses.size());
+    crypto->writerProcessId = GetCurrentProcessId();
+    crypto->clipboardSequence = sequence;
+    crypto->reserved = 0;
+    crypto->expiresAt = GetTickCount64() + kProtectionWindowMs;
+    ZeroMemory(crypto->addresses, sizeof(crypto->addresses));
     for (size_t index = 0; index < addresses.size(); ++index) {
-        g_crypto->addresses[index].kind = addresses[index].kind;
+        crypto->addresses[index].kind = addresses[index].kind;
         const auto& canonical = addresses[index].canonical;
-        memcpy(g_crypto->addresses[index].canonical, canonical.data(),
+        memcpy(crypto->addresses[index].canonical, canonical.data(),
                canonical.size() * sizeof(wchar_t));
     }
-    UnlockCryptoState();
+    UnlockCryptoState(crypto);
 }
 
 static bool QueryProcessIdentity(DWORD processId,
@@ -383,21 +426,21 @@ static bool QueryProcessIdentity(DWORD processId,
 
 static clip::RuleSourceIdentity CurrentClipboardSource(DWORD sequence) {
     clip::RuleSourceIdentity source;
-    if (g_source) {
+    if (auto* shared = g_source.load(std::memory_order_acquire)) {
         clip::SharedClipboardSource snapshot = {};
         for (int attempt = 0; attempt < 4; ++attempt) {
-            const LONG before = InterlockedCompareExchange(&g_source->guard, 0, 0);
+            const LONG before = InterlockedCompareExchange(&shared->guard, 0, 0);
             if (before != 0) {
                 YieldProcessor();
                 continue;
             }
             MemoryBarrier();
-            snapshot.sequence = g_source->sequence;
-            snapshot.processId = g_source->processId;
-            memcpy(snapshot.processPath, g_source->processPath,
+            snapshot.sequence = shared->sequence;
+            snapshot.processId = shared->processId;
+            memcpy(snapshot.processPath, shared->processPath,
                    sizeof(snapshot.processPath));
             MemoryBarrier();
-            if (InterlockedCompareExchange(&g_source->guard, 0, 0) == 0)
+            if (InterlockedCompareExchange(&shared->guard, 0, 0) == 0)
                 break;
             snapshot.sequence = 0;
         }
@@ -422,20 +465,21 @@ static clip::RuleSourceIdentity CurrentClipboardSource(DWORD sequence) {
 }
 
 static void PublishClipboardSource() noexcept {
-    if (!g_source) return;
+    auto* shared = g_source.load(std::memory_order_acquire);
+    if (!shared) return;
     const DWORD sequence = GetClipboardSequenceNumber();
     if (!sequence) return;
-    InterlockedExchange(&g_source->guard, 1);
-    g_source->sequence = sequence;
-    g_source->processId = GetCurrentProcessId();
+    InterlockedExchange(&shared->guard, 1);
+    shared->sequence = sequence;
+    shared->processId = GetCurrentProcessId();
     const size_t length = (std::min)(
         g_processPathLower.size(),
         static_cast<size_t>(clip::kClipboardSourcePathChars - 1));
-    memcpy(g_source->processPath, g_processPathLower.data(),
+    memcpy(shared->processPath, g_processPathLower.data(),
            length * sizeof(wchar_t));
-    g_source->processPath[length] = L'\0';
+    shared->processPath[length] = L'\0';
     MemoryBarrier();
-    InterlockedExchange(&g_source->guard, 0);
+    InterlockedExchange(&shared->guard, 0);
 }
 
 // A bounded spin avoids both indefinite host-thread waits and needless audit
@@ -533,9 +577,15 @@ static void QueueCryptoBlock(clip::ClipOp op, UINT format,
                              const clip::RuleSourceIdentity* source,
                              const std::wstring& ruleName,
                              bool cryptoContent = false) noexcept {
+    // 被拦截的延迟渲染不会改变剪贴板，每次有程序读取都会重试；同一剪贴板版本只记录一次。
+    static std::atomic<DWORD> lastWriteBlockSequence{0};
+    const DWORD sequence = GetClipboardSequenceNumber();
+    if (op == clip::kOpWrite && sequence != 0 &&
+        lastWriteBlockSequence.exchange(sequence, std::memory_order_acq_rel) ==
+            sequence)
+        return;
     QueueEvent(op, format, clip::kRuleBlock, true, 0, L"",
-               GetClipboardSequenceNumber(), source, &ruleName, true,
-               cryptoContent);
+               sequence, source, &ruleName, true, cryptoContent);
 }
 
 
@@ -678,6 +728,19 @@ static bool IgnoreCustomClipboardFormat(UINT format) {
     return TextEncodingForFormat(format) == ClipboardTextEncoding::none;
 }
 
+// 截断的 UTF-8 前缀可能切在多字节字符中间：退回到最后一个完整字符边界，
+// 否则严格解码失败会让内容规则拿不到文本而被整体跳过。
+static size_t CompleteUtf8Prefix(const char* text, size_t length) {
+    size_t start = length;
+    while (start > 0 && length - start < 3 &&
+           (static_cast<unsigned char>(text[start - 1]) & 0xC0) == 0x80)
+        --start;
+    if (start == 0) return length;
+    const unsigned char lead = static_cast<unsigned char>(text[start - 1]);
+    const size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+    return length - (start - 1) < need ? start - 1 : length;
+}
+
 static bool PeekClipboardText(UINT format, HANDLE memory, std::wstring& content,
                                unsigned long long& hash,
                                bool& contentComplete, bool& textFormat) {
@@ -699,14 +762,17 @@ static bool PeekClipboardText(UINT format, HANDLE memory, std::wstring& content,
     const DWORD flags = encoding == ClipboardTextEncoding::utf8
                             ? MB_ERR_INVALID_CHARS
                             : 0;
+    size_t length = snapshot.length;
+    if (encoding == ClipboardTextEncoding::utf8 && !contentComplete)
+        length = CompleteUtf8Prefix(snapshot.text, length);
     const int chars = MultiByteToWideChar(
         codePage, flags, snapshot.text,
-        static_cast<int>(snapshot.length), nullptr, 0);
-    if (snapshot.length != 0 && chars <= 0) return false;
+        static_cast<int>(length), nullptr, 0);
+    if (length != 0 && chars <= 0) return false;
     content.resize(static_cast<size_t>(chars));
     if (chars > 0 &&
         MultiByteToWideChar(codePage, flags, snapshot.text,
-                            static_cast<int>(snapshot.length), content.data(),
+                            static_cast<int>(length), content.data(),
                             chars) != chars)
         return false;
     hash = contentComplete ? clip::FnvHash64(content) : 0;
@@ -931,27 +997,18 @@ static ClipboardSnapshot CaptureClipboardSnapshot(UINT format,
     return {};
 }
 
-// 返回值：0=未知（拿不到锁，按放行处理），1=未暂停，2=已暂停
+// 返回值：1=未暂停，2=已暂停或未连接。用原子量读取，宿主线程互相争用时不会误判为放行。
 static int PausedState() {
     if (!g_connected.load(std::memory_order_acquire)) return 2;
-    if (!TryEnterCriticalSection(&g_cs)) return 0;
-    int state = g_paused ? 2 : 1;
-    LeaveCriticalSection(&g_cs);
-    return state;
+    return g_paused.load(std::memory_order_acquire) ? 2 : 1;
 }
 
 static bool PreviewEnabled() {
-    if (!TryEnterCriticalSection(&g_cs)) return false;
-    bool enabled = g_previewEnabled;
-    LeaveCriticalSection(&g_cs);
-    return enabled;
+    return g_previewEnabled.load(std::memory_order_acquire);
 }
 
 static bool ShortcutOnlyEnabled() {
-    if (!TryEnterCriticalSection(&g_cs)) return false;
-    const bool enabled = g_shortcutOnlyMode;
-    LeaveCriticalSection(&g_cs);
-    return enabled;
+    return g_shortcutOnlyMode.load(std::memory_order_acquire);
 }
 
 static bool ShortcutTokenActive(bool write) {
@@ -961,8 +1018,20 @@ static bool ShortcutTokenActive(bool write) {
     return deadline != 0 && GetTickCount64() <= deadline;
 }
 
+// 用户复制时取得所有权的本进程窗口仍是当前剪贴板所有者。
+static bool OwnerUserClipboard() {
+    const HWND window = g_userOwnerWindow.load(std::memory_order_acquire);
+    DWORD processId = 0;
+    return window && GetClipboardOwner() == window &&
+           GetWindowThreadProcessId(window, &processId) &&
+           processId == GetCurrentProcessId();
+}
+
+// 延迟渲染（WM_RENDERFORMAT、OleFlushClipboard 等）在复制之后才由所有者补写数据，
+// 本线程没有重新清空剪贴板时沿用当初登记格式时的用户授权。
 static bool LikelyUserClipboardWrite() {
-    return ShortcutTokenActive(true);
+    return ShortcutTokenActive(true) ||
+           (!g_clipboardEmptied && OwnerUserClipboard());
 }
 
 static bool DirectShortcutAllowed(bool write) {
@@ -1067,6 +1136,11 @@ static void ClosePipe() noexcept {
     g_controlInput.clear();
     g_controlPartialSince = 0;
     g_connected.store(false, std::memory_order_release);
+    // 协商结果只对旧连接有效；重连后积压事件先按旧格式发出会被新连接丢弃。
+    g_extendedStateApplied.store(false, std::memory_order_release);
+    g_notificationStateApplied.store(false, std::memory_order_release);
+    g_logVisibilityStateApplied.store(false, std::memory_order_release);
+    g_textMetadataEnabled.store(false, std::memory_order_release);
     g_snapshotProtocolCapable.store(false, std::memory_order_release);
     g_snapshotTransportEnabled.store(false, std::memory_order_release);
     CancelConfirmations();
@@ -1238,8 +1312,8 @@ static bool BindPipeServer(HANDLE pipe) {
     g_controllerProcess = process;
     g_controllerPid = pid;
     g_controllerCreated = created;
-    if (!g_source) OpenSourceMapping();
-    if (!g_crypto) OpenCryptoMapping();
+    if (!g_source.load(std::memory_order_acquire)) OpenSourceMapping();
+    if (!g_crypto.load(std::memory_order_acquire)) OpenCryptoMapping();
     return true;
 }
 
@@ -1324,12 +1398,15 @@ static bool SendEventGap() {
 static int PumpServerMessages() {
     DWORD available = 0;
     if (!PeekNamedPipe(g_pipe, nullptr, 0, nullptr, &available, nullptr)) return -1;
-    if (available) {
+    // 每轮最多读 64KB：按 4KB/30ms 读取时，较大的规则帧会撞上 5 秒半帧超时。
+    // 规则帧上限约 1MB，加上一轮预读仍低于 kIpcMaxPayload 的 128KB 余量。
+    for (int chunk = 0; available != 0 && chunk < 16; ++chunk) {
         char buffer[4096];
         DWORD want = (std::min)(available, (DWORD)sizeof(buffer));
         DWORD got = 0;
         if (!ReadFile(g_pipe, buffer, want, &got, nullptr) || got == 0) return -1;
         g_controlInput.append(buffer, got);
+        available -= got;
     }
 
     for (;;) {
@@ -1371,11 +1448,7 @@ static int PumpServerMessages() {
         } else if (type == clip::kIpcPause) {
             BYTE paused = 0;
             ok = r.GetU8(paused) && r.n == 0;
-            if (ok) {
-                EnterCriticalSection(&g_cs);
-                g_paused = paused != 0;
-                LeaveCriticalSection(&g_cs);
-            }
+            if (ok) g_paused.store(paused != 0, std::memory_order_release);
         } else if (type == clip::kIpcRules ||
                    type == clip::kIpcRulesExtended) {
             DWORD count = 0;
@@ -1532,11 +1605,9 @@ static int PumpServerMessages() {
             ok = ok && r.n == 0;
             if (ok) {
                 g_textMetadataEnabled.store(textMetadata != 0, std::memory_order_release);
-                EnterCriticalSection(&g_cs);
-                const bool wasShortcutOnly = g_shortcutOnlyMode;
-                g_previewEnabled = preview != 0;
-                g_shortcutOnlyMode = shortcutOnly != 0;
-                LeaveCriticalSection(&g_cs);
+                g_previewEnabled.store(preview != 0, std::memory_order_release);
+                const bool wasShortcutOnly = g_shortcutOnlyMode.exchange(
+                    shortcutOnly != 0, std::memory_order_acq_rel);
                 if (cryptoPresent) {
                     g_cryptoEnabled.store(crypto != 0, std::memory_order_release);
                     g_cryptoSettingKnown.store(true, std::memory_order_release);
@@ -1574,6 +1645,7 @@ static int PumpServerMessages() {
                     previousShortcutWindowMs != nextShortcutWindowMs) {
                     g_copyShortcutUntil.store(0, std::memory_order_release);
                     g_pasteShortcutUntil.store(0, std::memory_order_release);
+                    g_userOwnerWindow.store(nullptr, std::memory_order_release);
                 }
                 // settings is the final member of a complete state snapshot.
                 g_connected.store(true, std::memory_order_release);
@@ -1600,7 +1672,8 @@ static int PumpServerMessages() {
                             : 0);
                     clip::PutU8(
                         ackPayload,
-                        (g_crypto ? clip::kStateAckCryptoMappingAvailable : 0) |
+                        (g_crypto.load(std::memory_order_acquire)
+                             ? clip::kStateAckCryptoMappingAvailable : 0) |
                         clip::kStateAckPrivateClipboardAvailable |
                         clip::kStateAckTextMetadataAvailable);
                     clip::PutFrame(ack, clip::kIpcStateAck, ackPayload);
@@ -2012,6 +2085,7 @@ static bool RunDetourTransaction(bool install, clip::ShutdownTrace* trace = null
         clip::TraceMark(trace, "module.check.begin", g_activeDetourCalls.load());
         g_moduleSafeToRelease.store(
             g_activeDetourCalls.load(std::memory_order_acquire) == 0 &&
+                g_activePrivateCalls.load(std::memory_order_acquire) == 0 &&
                 FrozenThreadsOutsideSelf(frozen, deadline),
             std::memory_order_release);
         clip::TraceMark(trace, "module.check.end", g_moduleSafeToRelease.load());
@@ -2042,7 +2116,7 @@ extern "C" __declspec(dllexport) void ClipHookAbortNextDetachForTest() {
 #endif
 
 static bool InstallHooks() {
-    privateclip::Initialize(&g_activeDetourCalls);
+    privateclip::Initialize(&g_activePrivateCalls);
     if (g_hooksInstalled.load(std::memory_order_acquire)) return true;
     bool ok = RunDetourTransaction(true);
     g_hooksInstalled.store(ok, std::memory_order_release);
@@ -2082,10 +2156,14 @@ static HMODULE PrepareWorkerExit(bool allowRestart, clip::ShutdownTrace* trace) 
     if (trace) trace->Close();
     // Otherwise retain one reference for in-flight returns. A later worker
     // reuses it and can release it after a quiescent detach transaction.
-    if (allowRestart) g_workerStarted.store(false, std::memory_order_release);
     // Publish workerRunning last. A concurrent reinjection can now start only
     // after the old handles are closed and the module reference is settled.
+    // 两个标志在 EnsureWorker 的同一把锁内发布：否则新 worker 置位的 running
+    // 可能被这里的清零覆盖，导致再次重启出第二个 worker。
+    EnterCriticalSection(&g_workerStartCs);
+    if (allowRestart) g_workerStarted.store(false, std::memory_order_release);
     g_workerRunning.store(0, std::memory_order_release);
+    LeaveCriticalSection(&g_workerStartCs);
 #ifdef CLIP_TEST_EXPORTS
     if (HANDLE stopped = g_testWorkerStoppedEvent.load(std::memory_order_acquire))
         SetEvent(stopped);
@@ -2118,7 +2196,7 @@ static HMODULE PrepareWorkerExit(bool allowRestart, clip::ShutdownTrace* trace) 
 
 static DWORD PipeThreadBody() {
     g_dbThread = 1;
-    g_workerRunning.store(1, std::memory_order_release);
+    // g_workerRunning 已由 EnsureWorker 在 CreateThread 之前置位。
     if (WaitForStop(0)) WorkerExit(true);
     PrepareProcessIdentity();
     // Standalone regression hosts provide explicit lifetime signals. Normal
@@ -2445,8 +2523,12 @@ static BOOL WINAPI OpenClipboard_Impl(HWND owner) {
     if (privateclip::Open(owner, privateResult)) return privateResult;
     DWORD incomingLastError = GetLastError();
     const int state = PausedState();
+    // 所有者以自己的窗口打开剪贴板补写延迟渲染数据（OleFlushClipboard、
+    // WM_RENDERALLFORMATS）时放行；其他窗口不借用这份授权。
     if (state != 2 && state != 0 && ShortcutOnlyEnabled() &&
-        !AnyShortcutTokenActive()) {
+        !AnyShortcutTokenActive() &&
+        !(owner && owner == g_userOwnerWindow.load(std::memory_order_acquire) &&
+          OwnerUserClipboard())) {
         QueueShortcutBlock(clip::kOpOpen, 0);
         SetLastError(ERROR_ACCESS_DENIED);
         return FALSE;
@@ -2456,6 +2538,7 @@ static BOOL WINAPI OpenClipboard_Impl(HWND owner) {
     if (opened) {
         g_clipboardModified = false;
         g_cryptoClearPending = false;
+        g_clipboardEmptied = false;
     }
     return opened;
 }
@@ -2472,7 +2555,7 @@ static BOOL WINAPI OpenClipboard_Cpp(HWND owner) noexcept {
 }
 
 static BOOL WINAPI Hooked_OpenClipboard(HWND owner) {
-    DWORD incomingLastError = GetLastError();
+    // 计数之前不得调用模块外函数，否则卸载检查可能漏掉停在外部、返回地址在本模块的线程。
     BOOL result = FALSE;
     g_activeDetourCalls.fetch_add(1, std::memory_order_acq_rel);
     __try {
@@ -2480,7 +2563,6 @@ static BOOL WINAPI Hooked_OpenClipboard(HWND owner) {
             result = OpenClipboard_Cpp(owner);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            UNREFERENCED_PARAMETER(incomingLastError);
             SetLastError(ERROR_FUNCTION_FAILED);
             result = FALSE;
         }
@@ -2506,6 +2588,8 @@ static BOOL WINAPI CloseClipboard_Impl() {
     const DWORD lastError = GetLastError();
     if (closed && g_clipboardModified) PublishClipboardSource();
     g_clipboardModified = false;
+    // 同一线程随后收到 WM_RENDERFORMAT 时属于延迟渲染补写，不再视为本线程清空过。
+    g_clipboardEmptied = false;
     SetLastError(lastError);
     return closed;
 }
@@ -2665,7 +2749,6 @@ static HANDLE WINAPI Hooked_GetClipboardData(UINT fmt) {
 #ifdef CLIP_TEST_EXPORTS
     g_testHookCalls.fetch_add(1, std::memory_order_relaxed);
 #endif
-    DWORD incomingLastError = GetLastError();
     HANDLE result = nullptr;
     g_activeDetourCalls.fetch_add(1, std::memory_order_acq_rel);
     __try {
@@ -2673,7 +2756,6 @@ static HANDLE WINAPI Hooked_GetClipboardData(UINT fmt) {
             result = GetClipboardData_Cpp(fmt);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            UNREFERENCED_PARAMETER(incomingLastError);
             SetLastError(ERROR_FUNCTION_FAILED);
             result = nullptr;
         }
@@ -2700,7 +2782,7 @@ static HANDLE WINAPI SetClipboardData_Impl(UINT fmt, HANDLE mem) {
         source.nameLower = g_processNameLower;
         source.pathLower = g_processPathLower;
         if (state != 0 && ShortcutOnlyEnabled() &&
-            !ShortcutTokenActive(true)) {
+            !LikelyUserClipboardWrite()) {
             QueueEvent(clip::kOpWrite, fmt, clip::kRuleBlock, true, 0, L"",
                        GetClipboardSequenceNumber(), &source,
                        &g_ignoreCustomFormatName, false, false, nullptr, true);
@@ -2717,7 +2799,7 @@ static HANDLE WINAPI SetClipboardData_Impl(UINT fmt, HANDLE mem) {
         return result;
     }
     if (state != 0 && ShortcutOnlyEnabled() &&
-        !ShortcutTokenActive(true)) {
+        !LikelyUserClipboardWrite()) {
         QueueShortcutBlock(clip::kOpWrite, fmt);
         SetLastError(ERROR_ACCESS_DENIED);
         return nullptr;
@@ -2801,6 +2883,13 @@ static HANDLE WINAPI SetClipboardData_Impl(UINT fmt, HANDLE mem) {
                 ClearCryptoAddress();
             g_cryptoClearPending = false;
         }
+    } else if (!mem && textFormat && !OwnerUserClipboard() &&
+               IsClipboardFormatAvailable(fmt)) {
+        // 非用户主动复制只登记了延迟文本格式：保留基线，等所有者真正渲染写入时再比较
+        // 地址，否则 CloseClipboard 清掉基线后，渲染写入就无从判断是否替换。
+        // 用户复制照常在关闭时清除旧基线，之后的渲染按用户补写重新发布基线。
+        // 登记成功时返回值同样为 NULL，只能以格式已出现在剪贴板上为准。
+        g_cryptoClearPending = false;
     }
     QueueEvent(clip::kOpWrite, fmt, static_cast<BYTE>(match.action), false,
                redactContent ? 0 : hash,
@@ -2827,7 +2916,6 @@ static HANDLE WINAPI Hooked_SetClipboardData(UINT fmt, HANDLE mem) {
 #ifdef CLIP_TEST_EXPORTS
     g_testHookCalls.fetch_add(1, std::memory_order_relaxed);
 #endif
-    DWORD incomingLastError = GetLastError();
     HANDLE result = nullptr;
     g_activeDetourCalls.fetch_add(1, std::memory_order_acq_rel);
     __try {
@@ -2835,7 +2923,6 @@ static HANDLE WINAPI Hooked_SetClipboardData(UINT fmt, HANDLE mem) {
             result = SetClipboardData_Cpp(fmt, mem);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            UNREFERENCED_PARAMETER(incomingLastError);
             SetLastError(ERROR_FUNCTION_FAILED);
             result = nullptr;
         }
@@ -2846,14 +2933,27 @@ static HANDLE WINAPI Hooked_SetClipboardData(UINT fmt, HANDLE mem) {
     return result;
 }
 
+// 清空成功即取得所有权：记下是否由用户复制触发，延迟渲染补写时沿用。
+static void RecordUserOwnerWindow() noexcept {
+    g_userOwnerWindow.store(
+        ShortcutTokenActive(true) ? GetClipboardOwner() : nullptr,
+        std::memory_order_release);
+}
+
 static BOOL WINAPI EmptyClipboard_Impl() {
     BOOL privateResult = FALSE;
     if (privateclip::Empty(privateResult)) return privateResult;
+    // 无论随后是否被拦截，本会话的写入都不再算延迟渲染补写。
+    g_clipboardEmptied = true;
     DWORD incomingLastError = GetLastError();
     int state = PausedState();
     if (state == 2) {
         SetLastError(incomingLastError);
-        return Real_EmptyClipboard();
+        const BOOL ok = Real_EmptyClipboard();
+        const DWORD lastError = GetLastError();
+        if (ok) RecordUserOwnerWindow();
+        SetLastError(lastError);
+        return ok;
     }
     if (state != 0 && ShortcutOnlyEnabled() &&
         !ShortcutTokenActive(true)) {
@@ -2867,6 +2967,7 @@ static BOOL WINAPI EmptyClipboard_Impl() {
     if (ok) {
         g_clipboardModified = true;
         g_cryptoClearPending = true;
+        RecordUserOwnerWindow();
     }
     SetLastError(lastError);
     return ok;
@@ -2888,7 +2989,6 @@ static BOOL WINAPI Hooked_EmptyClipboard() {
 #ifdef CLIP_TEST_EXPORTS
     g_testHookCalls.fetch_add(1, std::memory_order_relaxed);
 #endif
-    DWORD incomingLastError = GetLastError();
     BOOL result = FALSE;
     g_activeDetourCalls.fetch_add(1, std::memory_order_acq_rel);
     __try {
@@ -2896,7 +2996,6 @@ static BOOL WINAPI Hooked_EmptyClipboard() {
             result = EmptyClipboard_Cpp();
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
-            UNREFERENCED_PARAMETER(incomingLastError);
             SetLastError(ERROR_FUNCTION_FAILED);
             result = FALSE;
         }
@@ -2909,39 +3008,62 @@ static BOOL WINAPI Hooked_EmptyClipboard() {
 
 // ---------------- 导出的钩子过程 ----------------
 
+static struct WorkerStartLock* g_heldWorkerStartLock = nullptr;
+
+struct WorkerStartLock {
+    bool held = false;
+    WorkerStartLock() noexcept {
+        EnterCriticalSection(&g_workerStartCs);
+        held = true;
+        g_heldWorkerStartLock = this;
+    }
+    void release() noexcept {
+        if (!held) return;
+        held = false;
+        if (g_heldWorkerStartLock == this) g_heldWorkerStartLock = nullptr;
+        LeaveCriticalSection(&g_workerStartCs);
+    }
+    ~WorkerStartLock() { release(); }
+    WorkerStartLock(const WorkerStartLock&) = delete;
+    WorkerStartLock& operator=(const WorkerStartLock&) = delete;
+    static void ReleaseIfHeld() noexcept {
+        if (g_heldWorkerStartLock) g_heldWorkerStartLock->release();
+    }
+};
+
 static void EnsureWorker(bool explicitStart) {
     if (g_isSelf) return;
+    WorkerStartLock startLock;
+    // 关闭后 g_workerStarted 仍为 true，避免 ACK 发出到 worker 退出之间被重新拉起。
+    // worker 已经退出时，显式启动必须能重开管道；Detours 未能卸下时同样如此。
     if (explicitStart &&
         g_workerRunning.load(std::memory_order_acquire) == 0 &&
-        !g_hooksInstalled.load(std::memory_order_acquire)) {
-        bool terminal = true;
-        if (g_workerStarted.compare_exchange_strong(
-                terminal, false, std::memory_order_acq_rel)) {
-            g_stop.store(false, std::memory_order_release);
-            g_shutdownRequested.store(false, std::memory_order_release);
-            g_connected.store(false, std::memory_order_release);
-            g_controlInput.clear();
-            g_controlPartialSince = 0;
-            EnterCriticalSection(&g_qcs);
-            g_queue.clear();
-            g_queuedSnapshotBytes = 0;
-            LeaveCriticalSection(&g_qcs);
-            CancelConfirmations();
-            g_droppedEvents.store(0, std::memory_order_release);
-            g_extendedStateApplied.store(false,
+        g_workerStarted.load(std::memory_order_acquire)) {
+        g_stop.store(false, std::memory_order_release);
+        g_shutdownRequested.store(false, std::memory_order_release);
+        g_connected.store(false, std::memory_order_release);
+        g_controlInput.clear();
+        g_controlPartialSince = 0;
+        EnterCriticalSection(&g_qcs);
+        g_queue.clear();
+        g_queuedSnapshotBytes = 0;
+        LeaveCriticalSection(&g_qcs);
+        CancelConfirmations();
+        g_droppedEvents.store(0, std::memory_order_release);
+        g_extendedStateApplied.store(false,
+                                     std::memory_order_release);
+        g_notificationStateApplied.store(false,
                                          std::memory_order_release);
-            g_notificationStateApplied.store(false,
-                                             std::memory_order_release);
-            g_logVisibilityStateApplied.store(false,
-                                              std::memory_order_release);
-            g_snapshotProtocolCapable.store(false,
-                                            std::memory_order_release);
-            g_snapshotTransportEnabled.store(false,
-                                             std::memory_order_release);
-        }
+        g_logVisibilityStateApplied.store(false,
+                                          std::memory_order_release);
+        g_snapshotProtocolCapable.store(false,
+                                        std::memory_order_release);
+        g_snapshotTransportEnabled.store(false,
+                                         std::memory_order_release);
+        CloseControllerSignals();
+        g_workerStarted.store(false, std::memory_order_release);
     }
-    bool expected = false;
-    if (!g_workerStarted.compare_exchange_strong(expected, true)) return;
+    if (g_workerStarted.exchange(true, std::memory_order_acq_rel)) return;
 
     const std::wstring stopEventName =
         clip::ResolveObjectName(L"CLIP_TEST_STOP_EVENT", L"");
@@ -2981,8 +3103,12 @@ static void EnsureWorker(bool explicitStart) {
         }
         g_workerModule.store(module, std::memory_order_release);
     }
+    // 必须在线程真正运行之前置位：否则紧随其后的显式启动消息会把尚未运行的
+    // worker 当作已退出，再 reset 并创建第二个 worker。
+    g_workerRunning.store(1, std::memory_order_release);
     HANDLE thread = CreateThread(nullptr, 0, PipeThread, nullptr, 0, nullptr);
     if (!thread) {
+        g_workerRunning.store(0, std::memory_order_release);
         CloseControllerSignals();
         g_workerStarted.store(false, std::memory_order_release);
         return;
@@ -2994,6 +3120,7 @@ static void EnsureWorkerCpp(bool explicitStart) noexcept {
     try {
         EnsureWorker(explicitStart);
     } catch (...) {
+        WorkerStartLock::ReleaseIfHeld();
         g_connected.store(false, std::memory_order_release);
         CloseControllerSignals();
         g_workerStarted.store(false, std::memory_order_release);
@@ -3005,6 +3132,7 @@ static void EnsureWorkerSafe(bool explicitStart = false) {
         EnsureWorkerCpp(explicitStart);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
+        WorkerStartLock::ReleaseIfHeld();
         g_connected.store(false, std::memory_order_release);
         g_workerStarted.store(false, std::memory_order_release);
     }
@@ -3050,10 +3178,10 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
         DisableThreadLibraryCalls(self);
         g_isSelf = IsSelfProcess();
         if (!g_isSelf) {
-            InitializeCriticalSection(&g_cs);
             InitializeCriticalSection(&g_qcs);
             InitializeCriticalSection(&g_pipeCs);
             InitializeCriticalSection(&g_confirmationCs);
+            InitializeCriticalSection(&g_workerStartCs);
             g_pipeCsInitialized = true;
         }
     } else if (reason == DLL_PROCESS_DETACH) {
@@ -3067,10 +3195,10 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
         if (g_workerRunning.load(std::memory_order_acquire) == 0 &&
             !g_hooksInstalled.load(std::memory_order_acquire) &&
             g_pipeCsInitialized) {
-            DeleteCriticalSection(&g_cs);
             DeleteCriticalSection(&g_qcs);
             DeleteCriticalSection(&g_pipeCs);
             DeleteCriticalSection(&g_confirmationCs);
+            DeleteCriticalSection(&g_workerStartCs);
             g_pipeCsInitialized = false;
         }
     }

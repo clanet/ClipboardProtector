@@ -238,7 +238,14 @@ bool QueryAutostart(AutostartState& state) {
         state = AutostartState::Absent;
         return true;
     }
-    size_t enabled = xml.find(L"<Enabled>");
+    // 只取任务 <Settings> 下的 Enabled：<Triggers> 排在前面，触发器自己的
+    // Enabled 不受 /Change /DISABLE 影响。
+    const size_t settings = xml.find(L"<Settings>");
+    const size_t settingsEnd = settings == std::wstring::npos
+        ? std::wstring::npos : xml.find(L"</Settings>", settings);
+    size_t enabled = settings == std::wstring::npos
+        ? std::wstring::npos : xml.find(L"<Enabled>", settings);
+    if (enabled > settingsEnd) enabled = std::wstring::npos;
     // Enabled is optional in the Task Scheduler schema and defaults to true.
     // schtasks omits it for newly-created enabled tasks on current Windows.
     if (enabled == std::wstring::npos) {

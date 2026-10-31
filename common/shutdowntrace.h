@@ -18,6 +18,8 @@ public:
     bool enabled() const noexcept { return view_ != nullptr; }
 
 private:
+    // 约 128KB 的路径缓冲区单独成帧：未开启跟踪时不占用调用线程的栈。
+    __declspec(noinline) bool OpenEnabled(const wchar_t* role, HMODULE module) noexcept;
     static constexpr DWORD kHeaderBytes = 2048;
     static constexpr DWORD kLineBytes = 256;
     static constexpr DWORD kRecords = 4096;

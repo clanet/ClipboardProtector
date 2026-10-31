@@ -14,6 +14,7 @@
 #include "rules.h"
 #include "util.h"
 #include <commdlg.h>
+#include <cderr.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <windowsx.h>
@@ -1045,6 +1046,13 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         // NOTIFYICON_VERSION_4 puts the mouse/balloon event in lParam;
         // wParam carries the callback coordinates/identifier.
         WORD ev = LOWORD(lp);
+        // 模态对话框期间主窗口被禁用：托盘只把对话框提到前台，不执行命令，
+        // 否则会重入规则/设置对话框，或让对话框关闭时用旧快照覆盖新状态。
+        if (!IsWindowEnabled(hwnd_)) {
+            if (ev == WM_CONTEXTMENU || ev == NIN_SELECT || ev == WM_LBUTTONDBLCLK)
+                SetForegroundWindow(GetLastActivePopup(hwnd_));
+            return 0;
+        }
         if (ev == WM_CONTEXTMENU) {
             ShowContextMenu(GET_X_LPARAM(wp), GET_Y_LPARAM(wp));
         } else if (ev == NIN_BALLOONUSERCLICK) {
@@ -1069,6 +1077,8 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
             if (font) DeleteObject(font);
         }
         uiFont_ = titleFont_ = metricFont_ = sectionFont_ = smallFont_ = nullptr;
+        // ListView 未设 LVS_SHAREIMAGELISTS，先解绑，否则它销毁时会再销毁一次。
+        SendMessageW(lv_, LVM_SETIMAGELIST, LVSIL_SMALL, 0);
         if (rowHeightImages_) ImageList_Destroy(rowHeightImages_);
         rowHeightImages_ = nullptr;
         PostQuitMessage(0);
@@ -2076,8 +2086,8 @@ const LogRow* MainWindow::ListRow(int index) const {
 
 int MainWindow::ListIndexForRow(const LogRow* row) const {
     if (!row) return -1;
-    const int count = ListView_GetItemCount(lv_);
-    for (int i = 0; i < count; ++i) {
+    // 新行插在顶部，裁剪和释放快照针对的都是最旧的行：从末尾找，满额后不再每条事件扫描整表。
+    for (int i = ListView_GetItemCount(lv_); i-- > 0;) {
         if (ListRow(i) == row) return i;
     }
     return -1;
@@ -2087,7 +2097,9 @@ void MainWindow::TrimToLimit() {
     int limit = g_app.cfg.settings.maxLogEntries;
     while ((int)rows_.size() > limit) {
         const LogRow* removed = &rows_.back();
-        const int listIndex = ListIndexForRow(removed);
+        // 列表与 rows_ 同序：最旧的行若在列表中必定是最后一项，隐藏行无需扫描。
+        const int last = ListView_GetItemCount(lv_) - 1;
+        const int listIndex = ListRow(last) == removed ? last : -1;
         snapshotBytes_ -=
             (std::min)(snapshotBytes_, rows_.back().snapshot.size());
         rows_.pop_back();
@@ -2288,7 +2300,12 @@ void MainWindow::ExportCsv() {
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrDefExt = L"csv";
     ofn.Flags = OFN_OVERWRITEPROMPT;
-    if (!GetSaveFileNameW(&ofn)) return;
+    if (!GetSaveFileNameW(&ofn)) {
+        // 路径超出缓冲区时对话框同样返回失败，不能当作用户取消而静默忽略。
+        if (CommDlgExtendedError() == FNERR_BUFFERTOOSMALL)
+            UiMessageBox(hwnd_, UiText(TextId::CouldNotCreateTheFile), UiText(TextId::ExportFailed), MB_ICONERROR);
+        return;
+    }
 
     HANDLE h = CreateFileW(file, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -2493,18 +2510,26 @@ void MainWindow::AddRuleFromLog(int index) {
 void MainWindow::CopyLogContent(int index) {
     const LogRow* selected = ListRow(index);
     if (!selected) return;
-    const LogRow& row = *selected;
-    if (row.gap || !CanCopyLogContent(row)) return;
-    if (row.snapshotKind == kSnapshotImage ||
-        row.snapshotKind == kSnapshotFiles) {
+    if (selected->gap || !CanCopyLogContent(*selected)) return;
+    if (selected->snapshotKind == kSnapshotImage ||
+        selected->snapshotKind == kSnapshotFiles) {
+        const unsigned long long rowId = selected->id;
         const wchar_t* warning =
-            row.snapshotKind == kSnapshotFiles
+            selected->snapshotKind == kSnapshotFiles
                 ? UiText(TextId::ThisWillReplaceTheCurrentClipboardWith)
                 : UiText(TextId::ThisWillReplaceTheCurrentClipboardWith2);
         if (UiMessageBox(hwnd_, warning, UiText(TextId::RestoreClipboard),
                         MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES)
             return;
+        // 确认框期间新事件可能已把这一行裁剪掉，按 id 重新查找。
+        const auto found = std::find_if(
+            rows_.begin(), rows_.end(), [rowId](const LogRow& candidate) {
+                return candidate.id == rowId;
+            });
+        if (found == rows_.end()) return;
+        selected = &*found;
     }
+    const LogRow& row = *selected;
     bool copied = false;
     if (!row.preview.empty()) {
         copied = WriteClipboardText(hwnd_, row.preview);

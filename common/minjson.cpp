@@ -170,6 +170,16 @@ private:
                 ++pos_;
             }
         }
+        // \u 转义可产生孤立代理；它无法再保存为 UTF-8，读入后会让之后每次保存都失败。
+        for (size_t i = 0; ok_ && i < out.size(); ++i) {
+            const wchar_t c = out[i];
+            if (c >= 0xD800 && c <= 0xDBFF && i + 1 < out.size() &&
+                out[i + 1] >= 0xDC00 && out[i + 1] <= 0xDFFF) {
+                ++i;
+            } else if (c >= 0xD800 && c <= 0xDFFF) {
+                Fail();
+            }
+        }
         return out;
     }
 

@@ -739,10 +739,15 @@ bool SafeRegex::Search(std::wstring_view text, bool* completed,
                 bool termMatched = false;
                 switch (term.kind) {
                 case ClassKind::Range: {
-                    const wchar_t folded = Fold(value, ignoreCase_);
-                    const wchar_t first = Fold(term.first, ignoreCase_);
-                    const wchar_t last = Fold(term.last, ignoreCase_);
-                    termMatched = folded >= first && folded <= last;
+                    // 忽略大小写时分别比较原字符及其大小写形式；只折叠区间端点
+                    // 会让 [A-z] 漏掉 '_'，让 [@-Z] 误中 '_'。
+                    const auto inRange = [&term](wchar_t candidate) noexcept {
+                        return candidate >= term.first && candidate <= term.last;
+                    };
+                    termMatched = inRange(value) ||
+                        (ignoreCase_ &&
+                         (inRange(static_cast<wchar_t>(std::towlower(value))) ||
+                          inRange(static_cast<wchar_t>(std::towupper(value)))));
                     break;
                 }
                 case ClassKind::Digit:
@@ -794,6 +799,9 @@ bool SafeRegex::Search(std::wstring_view text, bool* completed,
                               value != static_cast<wchar_t>(0x2028) &&
                               value != static_cast<wchar_t>(0x2029);
                 } else if (state.op == Op::CharacterClass) {
+                    // 每个类项都计入工作量，超长字符类不能绕过预算。
+                    for (size_t term = 1; term < state.classTerms.size(); ++term)
+                        if (!consume()) return false;
                     matches = classMatches(state, text[position]);
                 }
                 if (matches &&

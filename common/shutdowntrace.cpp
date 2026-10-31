@@ -67,6 +67,10 @@ bool ShutdownTrace::Open(const wchar_t* role, HMODULE module) noexcept {
     wchar_t flag[8] = {};
     if (GetEnvironmentVariableW(L"CLIP_SHUTDOWN_TRACE", flag, _countof(flag)) != 1 ||
         flag[0] != L'1') return false;
+    return OpenEnabled(role, module);
+}
+
+bool ShutdownTrace::OpenEnabled(const wchar_t* role, HMODULE module) noexcept {
     wchar_t path[32768] = {};
     DWORD length = GetEnvironmentVariableW(L"CLIP_SHUTDOWN_LOG_DIR", path, _countof(path));
     if (length >= _countof(path)) return false;

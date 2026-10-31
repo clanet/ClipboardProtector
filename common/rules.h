@@ -264,12 +264,12 @@ inline bool FindClipboardRule(const std::vector<RuleLite>& rules,
             if (!rule.contentRegex.Search(*content, &regexCompleted,
                                           &ruleBudget)) {
                 regexBudget -= ruleBudgetStart - ruleBudget;
+                // 总预算耗尽后仍继续评估后续规则：无正则的规则照常匹配，
+                // 带正则的阻止/询问规则因无法完成匹配而按可能命中处理。
                 if ((regexCompleted && contentComplete) ||
                     (rule.action != kRuleBlock &&
-                     rule.action != kRuleConfirm)) {
-                    if (regexBudget == 0) return false;
+                     rule.action != kRuleConfirm))
                     continue;
-                }
             } else {
                 regexBudget -= ruleBudgetStart - ruleBudget;
             }

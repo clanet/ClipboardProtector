@@ -557,7 +557,9 @@ bool Open(HWND,BOOL& result) noexcept {
 bool Close(BOOL& result) noexcept {
     Record(128);
     if(!Blocking())return false;Lock lock;result=FALSE;
-    if(!Inside() || !opened || GetCurrentThreadId()!=clipboardThread){Deny();return true;}
+    // 会话之外打开的真实剪贴板必须能关闭，否则整个桌面的剪贴板会一直被占用。
+    if(!opened || GetCurrentThreadId()!=clipboardThread)return false;
+    if(!Inside()){Deny();return true;}
     opened=false;closed=true;result=TRUE;
     // Frameworks can finish the clipboard transaction outside DispatchMessage
     // (e.g. XAML pre-translation). CloseClipboard is the completion boundary

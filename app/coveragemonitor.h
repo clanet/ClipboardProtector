@@ -37,6 +37,7 @@ private:
         unsigned releaseAttempts = 0;
         bool wasReady = false;
         bool retainedReference = false;
+        ULONGLONG retainedSince = 0;
         ULONGLONG nextReleaseAttempt = 0;
     };
 
@@ -45,7 +46,8 @@ private:
     DWORD ThreadBody();
     void Scan();
     // Returns whether this attempt may have left an extra LoadLibrary ref.
-    bool StartTarget(const Entry& entry);
+    // allowLoad=false 时只启动已加载的模块，不再追加 LoadLibrary。
+    bool StartTarget(const Entry& entry, bool allowLoad);
     bool ReleaseTarget(const Entry& entry);
     bool Run32BitHelper(const wchar_t* command, const Entry& entry,
                         DWORD& exitCode);
