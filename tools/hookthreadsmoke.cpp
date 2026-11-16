@@ -110,6 +110,24 @@ int Run() {
     if (hook.Install(nullptr, nullptr, target.threadId) == ERROR_SUCCESS ||
         hook.installed() || hook.Remove() != ERROR_SUCCESS)
         return 2;
+    for (int round = 0; round < 2; ++round) {
+        HANDLE gate = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!gate) return 11;
+        hook.delayNextInstallForTest(gate, 1);
+        const DWORD installed = hook.Install(nullptr, nullptr, target.threadId);
+        SetEvent(gate);
+        // First consume the late failure notification in Remove, then repeat
+        // with the owner already gone. Both must clear state for the next install.
+        const bool exited = round == 0 || hook.waitForOwnerExitForTest(3000);
+        const DWORD removed = hook.Remove();
+        CloseHandle(gate);
+        if (installed != WAIT_TIMEOUT || !exited || removed != ERROR_SUCCESS ||
+            hook.Remove() != ERROR_SUCCESS || hook.installed())
+            return 12;
+        if (hook.Install(Hook, nullptr, target.threadId) != ERROR_SUCCESS ||
+            hook.Remove() != ERROR_SUCCESS)
+            return 13;
+    }
     for (int round = 0; round < 3; ++round) {
         if (hook.Install(Hook, nullptr, target.threadId) != ERROR_SUCCESS ||
             !hook.installed()) return 3;
@@ -144,6 +162,6 @@ int main() {
                      GetLastError());
         return result;
     }
-    std::puts("blocked-caller-responsive=1 removal-retry=1 restart=1 scoped-cleanup=1");
+    std::puts("blocked-caller-responsive=1 removal-retry=1 restart=1 scoped-cleanup=1 late-install-failure-recovered=1");
     return 0;
 }

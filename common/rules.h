@@ -110,6 +110,7 @@ inline bool IsRuleSetSupported(const std::vector<Rule>& rules) {
             !IsContentRegexSupported(rule.contentRegex, rule.ignoreCase) ||
             (rule.operations & kRuleReadWrite) == 0 ||
             !IsRuleDecision(rule.action) ||
+            rule.priority > kMaxRulePriority ||
             rule.format > kFormatPrivateKeyMnemonic ||
             (rule.format == kFormatNonText &&
              !rule.contentRegex.empty()) ||
@@ -161,7 +162,10 @@ inline int MatchRules(const std::vector<RuleLite>& rules,
         std::wstring_view candidate = r.isPath ? std::wstring_view(pathLower)
                                                : std::wstring_view(nameLower);
         bool hit = WildcardMatchBounded(r.patternLower, candidate, budget, exhausted);
-        if (exhausted) return def;
+        // 预算耗尽只表示结果未知：不授予放行，阻止/询问按可能命中处理。
+        // 继续扫描后续规则，避免跳过明确的 catch-all 阻止规则。
+        if (exhausted && (r.action == kRuleBlock || r.action == kRuleConfirm))
+            return r.action;
         if (hit) return r.action;
     }
     return def;
@@ -215,11 +219,14 @@ inline bool FindClipboardRule(const std::vector<RuleLite>& rules,
         const std::wstring_view candidate =
             rule.isPath ? std::wstring_view(pathLower)
                         : std::wstring_view(nameLower);
-        if (!WildcardMatchBounded(rule.patternLower, candidate, budget,
-                                  exhausted)) {
-            if (exhausted) return false;
+        const bool processMatches = WildcardMatchBounded(
+            rule.patternLower, candidate, budget, exhausted);
+        // 与正则预算一致：未知匹配不能授权放行；阻止/询问仍检查剩余条件。
+        // 预算为零时后续通配匹配只做常量工作，整个规则集仍保持有界。
+        if (!processMatches &&
+            (!exhausted || (rule.action != kRuleBlock &&
+                            rule.action != kRuleConfirm)))
             continue;
-        }
         bool sourceMatches = false;
         switch (rule.sourceMode) {
         case kSourceAny:
@@ -234,7 +241,9 @@ inline bool FindClipboardRule(const std::vector<RuleLite>& rules,
                     : std::wstring_view(source.nameLower);
             sourceMatches = WildcardMatchBounded(
                 rule.sourcePatternLower, sourceCandidate, budget, exhausted);
-            if (exhausted) return false;
+            if (exhausted)
+                sourceMatches = rule.action == kRuleBlock ||
+                                rule.action == kRuleConfirm;
             break;
         }
         case kSourceSameProcess:

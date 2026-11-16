@@ -11,6 +11,10 @@ void Poll() noexcept;
 bool CanDetach() noexcept;
 bool Blocking() noexcept;
 DWORD Diagnostics() noexcept;
+#ifdef CLIP_TEST_EXPORTS
+void SetPollRaceForTest(HANDLE entered, HANDLE resume) noexcept;
+DWORD RegisteredHooksForTest() noexcept;
+#endif
 void Fault() noexcept;
 bool Open(HWND owner, BOOL& result) noexcept;
 bool Close(BOOL& result) noexcept;

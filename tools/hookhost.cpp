@@ -49,25 +49,35 @@ bool IsBundledHookDll(const wchar_t* path) {
 DWORD RunRemoteCommand(int argc, wchar_t** argv) {
     if (argc != 5) return 2;
     const bool start = _wcsicmp(argv[1], L"--remote-start") == 0;
+    const bool startLoaded = _wcsicmp(argv[1], L"--remote-start-loaded") == 0;
     const bool release = _wcsicmp(argv[1], L"--remote-release") == 0;
     DWORD processId = 0;
     ULONGLONG creationTime = 0;
-    if ((!start && !release) || !ParseProcessId(argv[2], processId) ||
+    if ((!start && !startLoaded && !release) ||
+        !ParseProcessId(argv[2], processId) ||
         !ParseCreationTime(argv[3], creationTime) ||
         !IsBundledHookDll(argv[4]))
         return 2;
-    if (start) {
+    if (start || startLoaded) {
         const clip::RemoteHookStartResult result =
-            clip::RemoteHookStart(processId, creationTime, argv[4]);
-        if (result.started)
+            clip::RemoteHookStart(processId, creationTime, argv[4],
+                                  /*allowLoad=*/start);
+        if (result.started) {
+            if (result.releaseSubmitted) return clip::kRemoteHelperStartedSubmitted;
             return result.retainedReference
                        ? clip::kRemoteHelperStartedRetained
                        : clip::kRemoteHelperStarted;
+        }
+        if (result.releaseSubmitted) return clip::kRemoteHelperFailedSubmitted;
         return result.retainedReference ? clip::kRemoteHelperFailedRetained
                                         : clip::kRemoteHelperFailed;
     }
     DWORD error = ERROR_SUCCESS;
-    return clip::RemoteHookRelease(processId, creationTime, argv[4], error)
+    const clip::RemoteHookReleaseState result =
+        clip::RemoteHookRelease(processId, creationTime, argv[4], error);
+    if (result == clip::RemoteHookReleaseState::submitted)
+        return clip::kRemoteHelperStartedSubmitted;
+    return result == clip::RemoteHookReleaseState::released
                ? clip::kRemoteHelperStarted
                : clip::kRemoteHelperFailed;
 }
@@ -80,6 +90,7 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     if (!argv) return 2;
     if (argc >= 2 &&
         (_wcsicmp(argv[1], L"--remote-start") == 0 ||
+         _wcsicmp(argv[1], L"--remote-start-loaded") == 0 ||
          _wcsicmp(argv[1], L"--remote-release") == 0)) {
         const DWORD result = RunRemoteCommand(argc, argv);
         LocalFree(argv);

@@ -7,9 +7,12 @@ namespace clip {
 
 struct RemoteHookStartResult {
     bool started = false;
-    // True only when LoadLibrary added a reference that could not yet be
-    // balanced. The caller must retry RemoteHookRelease for this identity.
+    // True only while the caller still owns an unsubmitted balancing release.
+    // Once a release thread is submitted, never retry that reference.
     bool retainedReference = false;
+    // The balancing release was submitted but did not finish in this call.
+    // Never retry its decrement; a caller may still start the loaded module.
+    bool releaseSubmitted = false;
     DWORD error = ERROR_SUCCESS;
 };
 
@@ -20,13 +23,24 @@ struct RemoteHookStartResult {
 RemoteHookStartResult RemoteHookStart(DWORD processId,
                                       ULONGLONG expectedCreationTime,
                                       const std::wstring& dllPath,
-                                      bool allowLoad = true);
-bool RemoteHookRelease(DWORD processId, ULONGLONG expectedCreationTime,
-                       const std::wstring& dllPath, DWORD& error);
+                                      bool allowLoad = true,
+                                      HANDLE stopEvent = nullptr);
+enum class RemoteHookReleaseState { retryable, submitted, released };
+// submitted consumes the caller's release responsibility even when its remote
+// thread is still pending or its result is unknown. Only retryable may retry.
+RemoteHookReleaseState RemoteHookRelease(DWORD processId, ULONGLONG expectedCreationTime,
+                       const std::wstring& dllPath, DWORD& error,
+                       HANDLE stopEvent = nullptr);
 
 constexpr DWORD kRemoteHelperStarted = 0;
 constexpr DWORD kRemoteHelperStartedRetained = 10;
 constexpr DWORD kRemoteHelperFailedRetained = 11;
 constexpr DWORD kRemoteHelperFailed = 20;
+constexpr DWORD kRemoteHelperStartedSubmitted = 12;
+constexpr DWORD kRemoteHelperFailedSubmitted = 13;
+
+#ifdef CLIP_TEST_REMOTE_HOOK
+void RemoteHookReleaseForTest(LPTHREAD_START_ROUTINE function, DWORD timeout);
+#endif
 
 } // namespace clip

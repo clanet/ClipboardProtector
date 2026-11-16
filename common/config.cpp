@@ -36,6 +36,7 @@ static minjson::Value RulesToJson(const std::vector<Rule>& rules) {
         o.obj()[L"confirmTimeoutMs"] =
             minjson::Value::Num(r.confirmTimeoutMs);
         o.obj()[L"timeoutBlock"] = minjson::Value::Bool(r.timeoutBlock);
+        o.obj()[L"priority"] = minjson::Value::Num(r.priority);
         arr.array().push_back(std::move(o));
     }
     return arr;
@@ -123,6 +124,13 @@ static bool RulesFromJson(const minjson::Value& arr, int ruleModelVersion,
         r.confirmTimeoutMs = static_cast<unsigned int>(
             o.get(L"confirmTimeoutMs").asInt(15000));
         r.timeoutBlock = o.get(L"timeoutBlock").asBool(true);
+        if (ruleModelVersion >= 6) {
+            const long long priority =
+                o.get(L"priority").asInt(kDefaultRulePriority);
+            r.priority = static_cast<unsigned char>(
+                std::clamp<long long>(priority, kMinRulePriority,
+                                      kMaxRulePriority));
+        }
         if (!r.pattern.empty()) {
             if (out.size() >= 4096) return false;
             if (splitLegacyBlockchain) {
@@ -156,8 +164,9 @@ Config MakeFirstRunConfig(Language language) {
 }
 
 bool Config::Load(const std::wstring& path) {
-    // 存在却无法使用的文件先移为 .bak，避免之后保存默认配置时覆盖用户原文件。
-    // 移动失败时原文件仍在原处，由调用方决定是否继续。
+    // 只有确定“内容不可用”的格式/规则错误才备份为 .bak。拒绝访问、共享
+    // 冲突和读取失败可能只是瞬时的；此时保留原文件并让调用方退出/重试，
+    // 不能把有效配置移走。
     const auto backup = [&path] {
         MoveFileExW(path.c_str(), (path + L".bak").c_str(),
                     MOVEFILE_REPLACE_EXISTING);
@@ -166,29 +175,33 @@ bool Config::Load(const std::wstring& path) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
-        // 首次运行：文件不存在；其他错误（拒绝访问、共享冲突）同样先尝试备份。
-        return GetLastError() == ERROR_FILE_NOT_FOUND ? false : backup();
+        // 首次运行、权限或共享冲突：不移动文件，由调用方决定是否退出。
+        return false;
     }
 
     // 读全文（配置很小，一次读完）
     std::string utf8;
     char buf[4096];
     DWORD n = 0;
-    bool readOk = true;
+    bool readFailed = false;
+    bool tooLarge = false;
     for (;;) {
         if (!ReadFile(h, buf, sizeof(buf), &n, nullptr)) {
-            readOk = false;
+            readFailed = true;
             break;
         }
         if (n == 0) break;
         utf8.append(buf, n);
         if (utf8.size() > (4u << 20)) {
-            readOk = false;
+            tooLarge = true;
             break;
         }
     }
     CloseHandle(h);
-    if (!readOk) return backup();
+    // A read failure may be transient (AV/share violation); do not move the
+    // user's file. Oversized content is deterministically unusable.
+    if (readFailed) return false;
+    if (tooLarge) return backup();
 
     // UTF-8 -> UTF-16
     int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
@@ -277,6 +290,7 @@ bool Config::Load(const std::wstring& path) {
         if (!RulesFromJson(rulesValue, ruleModelVersion, parsedRules) ||
             !IsRuleSetSupported(parsedRules))
             return backup();
+        SortRulesByPriority(parsedRules);
         loadedRules = std::move(parsedRules);
     }
     settings = std::move(loadedSettings);
@@ -287,7 +301,7 @@ bool Config::Load(const std::wstring& path) {
 bool Config::Save(const std::wstring& path) const {
     if (!ValidHotkeys(settings.hotkeys)) return false;
     minjson::Value root = minjson::Value::Obj();
-    root.obj()[L"ruleModelVersion"] = minjson::Value::Num(5);
+    root.obj()[L"ruleModelVersion"] = minjson::Value::Num(6);
     auto s = minjson::Value::Obj();
     s.obj()[L"language"] = minjson::Value::Str(LanguageCode(settings.language));
     s.obj()[L"balloonNotificationsDisabled"] =

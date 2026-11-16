@@ -22,6 +22,8 @@ public:
 #ifdef CLIP_TEST_HOOK_THREAD
     HWND windowForTest() const;
     void failNextRemovalForTest();
+    void delayNextInstallForTest(HANDLE gate, DWORD timeout);
+    bool waitForOwnerExitForTest(DWORD timeout) const;
 #endif
 
 private:
@@ -29,6 +31,10 @@ private:
     static DWORD WINAPI Run(void* argument);
     std::shared_ptr<State> state_;
     std::atomic<bool> installed_{false};
+#ifdef CLIP_TEST_HOOK_THREAD
+    HANDLE installGateForTest_ = nullptr;
+    DWORD installTimeoutForTest_ = 10000;
+#endif
 };
 
 } // namespace clip

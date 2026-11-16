@@ -34,7 +34,11 @@ std::wstring FormatText(UINT format) {
 
 AccessConfirmationWindow::AccessConfirmationWindow(
     HWND owner, AccessConfirmationRequest request)
-    : owner_(owner), request_(std::move(request)) {}
+    : owner_(owner), request_(std::move(request)) {
+    if (!request_.deadline)
+        request_.deadline = GetTickCount64() + request_.timeoutMs;
+    deadline_ = request_.deadline;
+}
 
 AccessConfirmationWindow::~AccessConfirmationWindow() {
     if (hwnd_ && IsWindow(hwnd_)) DestroyWindow(hwnd_);
@@ -54,6 +58,7 @@ std::unique_ptr<AccessConfirmationWindow> AccessConfirmationWindow::Create(
 
 bool AccessConfirmationWindow::CreateWindowInstance(HINSTANCE instance,
                                                       size_t cascadeIndex) {
+    if (GetTickCount64() >= deadline_) return false;
     WNDCLASSEXW windowClass{sizeof(windowClass)};
     windowClass.style = CS_HREDRAW | CS_VREDRAW;
     windowClass.lpfnWndProc = WndProcStatic;
@@ -86,6 +91,7 @@ bool AccessConfirmationWindow::CreateWindowInstance(HINSTANCE instance,
         WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, x, y, width,
         height, nullptr, nullptr, instance, this);
     if (!hwnd_) return false;
+    if (GetTickCount64() >= deadline_) return false;
     ShowWindow(hwnd_, SW_SHOWNORMAL);
     UpdateWindow(hwnd_);
     FLASHWINFO flash{sizeof(flash), hwnd_, FLASHW_TRAY | FLASHW_TIMERNOFG, 3, 0};
@@ -162,7 +168,6 @@ LRESULT AccessConfirmationWindow::WndProc(UINT message, WPARAM wParam,
             reinterpret_cast<LPCREATESTRUCT>(lParam)->hInstance, nullptr);
         for (HWND control : {persistCheck_, blockButton_, allowButton_})
             SendMessageW(control, WM_SETFONT, (WPARAM)uiFont_, TRUE);
-        deadline_ = GetTickCount64() + request_.timeoutMs;
         SetTimer(hwnd_, kCountdownTimer, 250, nullptr);
         constexpr DWORD kDwmWindowCornerPreference = 33;
         const DWORD roundCorners = 2;
@@ -407,6 +412,10 @@ void AccessConfirmationWindow::DrawButton(
 
 void AccessConfirmationWindow::Finish(bool allow, bool persistDecision) {
     if (completed_) return;
+    if (GetTickCount64() >= deadline_) {
+        allow = !request_.timeoutBlock;
+        persistDecision = false;
+    }
     completed_ = true;
     KillTimer(hwnd_, kCountdownTimer);
     const bool persist = persistDecision &&

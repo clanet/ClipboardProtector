@@ -52,6 +52,8 @@ constexpr DWORD kStateAckCapabilityMarkerV10 = 0x30314143; // "CA10"
 constexpr DWORD kStateAckCapabilityMarkerV11 = 0x31314143; // "CA11"
 // CA12 adds CLR4 rules and a trailing event visibility byte.
 constexpr DWORD kStateAckCapabilityMarkerV12 = 0x32314143; // "CA12"
+// CA13 carries an absolute monotonic deadline on confirmation requests.
+constexpr DWORD kStateAckCapabilityMarkerV13 = 0x33314143; // "CA13"
 constexpr BYTE kStateAckCryptoMappingAvailable = 0x01;
 constexpr BYTE kStateAckPrivateClipboardAvailable = 0x02;
 // Negotiated by a trailing settings byte; adds typed event/confirmation labels.
@@ -288,6 +290,7 @@ inline bool ParseStateAck(const char* data, size_t size, StateAck& result) {
     case kStateAckCapabilityMarkerV10: parsed.version = 10; break;
     case kStateAckCapabilityMarkerV11: parsed.version = 11; break;
     case kStateAckCapabilityMarkerV12: parsed.version = 12; break;
+    case kStateAckCapabilityMarkerV13: parsed.version = 13; break;
     default: return false;
     }
     if (parsed.version >= 5 &&

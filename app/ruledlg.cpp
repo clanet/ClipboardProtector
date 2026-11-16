@@ -52,6 +52,15 @@ void FillFormatCombo(HWND dialog) {
     }
 }
 
+void FillPriorityCombo(HWND dialog) {
+    for (int priority = kMinRulePriority; priority <= kMaxRulePriority;
+         ++priority) {
+        const std::wstring value = std::to_wstring(priority);
+        SendDlgItemMessageW(dialog, IDC_CMB_PRIORITY, CB_ADDSTRING, 0,
+                            reinterpret_cast<LPARAM>(value.c_str()));
+    }
+}
+
 unsigned char SelectedFormat(HWND dialog) {
     const LRESULT selection = SendDlgItemMessageW(
         dialog, IDC_CMB_FORMAT, CB_GETCURSEL, 0, 0);
@@ -188,6 +197,7 @@ INT_PTR CALLBACK EditRuleProc(HWND dialog, UINT message, WPARAM wParam,
         FillCombo(dialog, IDC_CMB_NOTIFICATION, kNotificationNames);
         FillCombo(dialog, IDC_CMB_OPERATION, kOperationNames);
         FillFormatCombo(dialog);
+        FillPriorityCombo(dialog);
         FillCombo(dialog, IDC_CMB_SOURCE_MODE, kSourceNames);
         FillCombo(dialog, IDC_CMB_TIMEOUT_ACTION, kTimeoutNames);
         SendDlgItemMessageW(dialog, IDC_ED_RULE_NAME, EM_SETLIMITTEXT, 128, 0);
@@ -228,6 +238,11 @@ INT_PTR CALLBACK EditRuleProc(HWND dialog, UINT message, WPARAM wParam,
                             OperationIndex(context->rule.operations), 0);
         SendDlgItemMessageW(dialog, IDC_CMB_FORMAT, CB_SETCURSEL,
                             FormatIndex(context->rule.format), 0);
+        SendDlgItemMessageW(
+            dialog, IDC_CMB_PRIORITY, CB_SETCURSEL,
+            (std::min)(static_cast<int>(context->rule.priority),
+                       kMaxRulePriority),
+            0);
         SendDlgItemMessageW(dialog, IDC_CMB_SOURCE_MODE, CB_SETCURSEL,
                             (std::min)(static_cast<int>(context->rule.sourceMode),
                                        static_cast<int>(kSourceUnknown)), 0);
@@ -299,6 +314,12 @@ INT_PTR CALLBACK EditRuleProc(HWND dialog, UINT message, WPARAM wParam,
             candidate.format = SelectedFormat(dialog);
             if (candidate.format == kFormatNonText)
                 candidate.contentRegex.clear();
+            const LRESULT priority = SendDlgItemMessageW(
+                dialog, IDC_CMB_PRIORITY, CB_GETCURSEL, 0, 0);
+            candidate.priority =
+                priority >= kMinRulePriority && priority <= kMaxRulePriority
+                    ? static_cast<unsigned char>(priority)
+                    : static_cast<unsigned char>(kDefaultRulePriority);
             candidate.sourceMode = static_cast<unsigned char>(
                 SendDlgItemMessageW(dialog, IDC_CMB_SOURCE_MODE, CB_GETCURSEL,
                                     0, 0));
@@ -396,25 +417,26 @@ void RefreshRuleList(HWND dialog, const std::vector<Rule>& rules,
         item.pszText = order.data();
         const int row = ListView_InsertItem(list, &item);
         const Rule& rule = rules[i];
-        SetListText(list, row, 1, rule.enabled ? UiText(TextId::Enabled) : UiText(TextId::Disabled));
-        SetListText(list, row, 2,
-                    rule.name.empty() ? std::wstring(UiText(TextId::Unnamed)) : rule.name);
+        SetListText(list, row, 1, std::to_wstring(rule.priority));
+        SetListText(list, row, 2, rule.enabled ? UiText(TextId::Enabled) : UiText(TextId::Disabled));
         SetListText(list, row, 3,
+                    rule.name.empty() ? std::wstring(UiText(TextId::Unnamed)) : rule.name);
+        SetListText(list, row, 4,
                     std::wstring(UiText(rule.isPath ? kTypeNames[1] : kTypeNames[0])) +
                         UiText(TextId::Colon) + rule.pattern);
-        SetListText(list, row, 4, SourceDescription(rule));
-        SetListText(list, row, 5,
+        SetListText(list, row, 5, SourceDescription(rule));
+        SetListText(list, row, 6,
                     UiText(kOperationNames[OperationIndex(rule.operations)]));
-        SetListText(list, row, 6, FormatName(rule.format));
-        SetListText(list, row, 7,
+        SetListText(list, row, 7, FormatName(rule.format));
+        SetListText(list, row, 8,
                     rule.contentRegex.empty() ? std::wstring(UiText(TextId::AnyContent))
                                               : rule.contentRegex);
-        SetListText(list, row, 8,
+        SetListText(list, row, 9,
                     UiText(kDecisionNames[DecisionIndex(rule.action)]));
         std::wstring notification =
             UiText(kNotificationNames[rule.showNotification ? 1 : 0]);
         if (rule.hideFromLogList) notification += UiText(TextId::HiddenFromLog);
-        SetListText(list, row, 9, notification);
+        SetListText(list, row, 10, notification);
     }
     if (selected >= 0 && selected < static_cast<int>(rules.size())) {
         ListView_SetItemState(list, selected, LVIS_SELECTED | LVIS_FOCUSED,
@@ -429,7 +451,8 @@ void InitRuleColumns(HWND dialog) {
         list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
     struct Column { const wchar_t* name; int width; };
     const Column columns[] = {
-        {UiText(TextId::Order), 42}, {UiText(TextId::Status), 48}, {UiText(TextId::RuleName), 105},
+        {UiText(TextId::Order), 42}, {UiText(TextId::Priority2), 48},
+        {UiText(TextId::Status), 48}, {UiText(TextId::RuleName), 105},
         {UiText(TextId::Process), 145}, {UiText(TextId::Source), 150}, {UiText(TextId::Operation), 75},
         {UiText(TextId::Format2), 85}, {UiText(TextId::ContentCondition), 180}, {UiText(TextId::Decision), 75},
         {UiText(TextId::Notification), 95},
@@ -452,14 +475,28 @@ int SelectedRule(HWND dialog) {
                                 LVNI_SELECTED);
 }
 
-void UpdateRuleButtons(HWND dialog, size_t count) {
+int ReplaceRuleAndResort(std::vector<Rule>& rules, int selected, Rule rule) {
+    rules[static_cast<size_t>(selected)] = std::move(rule);
+    const std::vector<size_t> newIndex = SortRulesByPriority(rules);
+    return static_cast<int>(newIndex[static_cast<size_t>(selected)]);
+}
+
+void UpdateRuleButtons(HWND dialog, const std::vector<Rule>& rules) {
     const int selected = SelectedRule(dialog);
-    const BOOL valid = selected >= 0 && selected < static_cast<int>(count);
+    const BOOL valid =
+        selected >= 0 && selected < static_cast<int>(rules.size());
     EnableWindow(GetDlgItem(dialog, IDC_BTN_EDIT), valid);
     EnableWindow(GetDlgItem(dialog, IDC_BTN_DEL), valid);
-    EnableWindow(GetDlgItem(dialog, IDC_BTN_UP), valid && selected > 0);
-    EnableWindow(GetDlgItem(dialog, IDC_BTN_DOWN),
-                 valid && selected + 1 < static_cast<int>(count));
+    const bool canMoveUp =
+        valid && selected > 0 &&
+        rules[static_cast<size_t>(selected) - 1].priority ==
+            rules[static_cast<size_t>(selected)].priority;
+    const bool canMoveDown =
+        valid && selected + 1 < static_cast<int>(rules.size()) &&
+        rules[static_cast<size_t>(selected) + 1].priority ==
+            rules[static_cast<size_t>(selected)].priority;
+    EnableWindow(GetDlgItem(dialog, IDC_BTN_UP), canMoveUp);
+    EnableWindow(GetDlgItem(dialog, IDC_BTN_DOWN), canMoveDown);
 }
 
 INT_PTR CALLBACK RulesProc(HWND dialog, UINT message, WPARAM wParam,
@@ -472,16 +509,17 @@ INT_PTR CALLBACK RulesProc(HWND dialog, UINT message, WPARAM wParam,
         LocalizeDialog(dialog, IDD_RULES);
         output = reinterpret_cast<std::vector<Rule>*>(lParam);
         work = *output;
+        SortRulesByPriority(work);
         changed = false;
         InitRuleColumns(dialog);
         RefreshRuleList(dialog, work);
-        UpdateRuleButtons(dialog, work.size());
+        UpdateRuleButtons(dialog, work);
         return TRUE;
     case WM_NOTIFY: {
         const auto* header = reinterpret_cast<NMHDR*>(lParam);
         if (header->idFrom != IDC_LIST_RULES) break;
         if (header->code == LVN_ITEMCHANGED) {
-            UpdateRuleButtons(dialog, work.size());
+            UpdateRuleButtons(dialog, work);
             return TRUE;
         }
         if (header->code == NM_DBLCLK) {
@@ -489,9 +527,11 @@ INT_PTR CALLBACK RulesProc(HWND dialog, UINT message, WPARAM wParam,
             if (selected >= 0 && selected < static_cast<int>(work.size())) {
                 Rule rule = work[static_cast<size_t>(selected)];
                 if (EditRule(dialog, rule)) {
-                    work[static_cast<size_t>(selected)] = std::move(rule);
+                    const int newSelected =
+                        ReplaceRuleAndResort(work, selected, std::move(rule));
                     changed = true;
-                    RefreshRuleList(dialog, work, selected);
+                    RefreshRuleList(dialog, work, newSelected);
+                    UpdateRuleButtons(dialog, work);
                 }
             }
             return TRUE;
@@ -505,9 +545,12 @@ INT_PTR CALLBACK RulesProc(HWND dialog, UINT message, WPARAM wParam,
             rule.name = UiText(TextId::NewRule);
             rule.pattern = L"*";
             if (EditRule(dialog, rule)) {
-                work.insert(work.begin(), std::move(rule));
+                const size_t insertAt =
+                    RulePriorityGroupBegin(work, rule.priority);
+                work.insert(work.begin() + insertAt, std::move(rule));
                 changed = true;
-                RefreshRuleList(dialog, work, 0);
+                RefreshRuleList(dialog, work, static_cast<int>(insertAt));
+                UpdateRuleButtons(dialog, work);
             }
             return TRUE;
         }
@@ -517,9 +560,11 @@ INT_PTR CALLBACK RulesProc(HWND dialog, UINT message, WPARAM wParam,
                 return TRUE;
             Rule rule = work[static_cast<size_t>(selected)];
             if (EditRule(dialog, rule)) {
-                work[static_cast<size_t>(selected)] = std::move(rule);
+                const int newSelected =
+                    ReplaceRuleAndResort(work, selected, std::move(rule));
                 changed = true;
-                RefreshRuleList(dialog, work, selected);
+                RefreshRuleList(dialog, work, newSelected);
+                UpdateRuleButtons(dialog, work);
             }
             return TRUE;
         }
@@ -535,7 +580,7 @@ INT_PTR CALLBACK RulesProc(HWND dialog, UINT message, WPARAM wParam,
             RefreshRuleList(dialog, work,
                             (std::min)(selected,
                                        static_cast<int>(work.size()) - 1));
-            UpdateRuleButtons(dialog, work.size());
+            UpdateRuleButtons(dialog, work);
             return TRUE;
         }
         case IDC_BTN_UP:
@@ -544,12 +589,15 @@ INT_PTR CALLBACK RulesProc(HWND dialog, UINT message, WPARAM wParam,
             const int next = LOWORD(wParam) == IDC_BTN_UP ? selected - 1
                                                           : selected + 1;
             if (selected < 0 || next < 0 ||
-                next >= static_cast<int>(work.size()))
+                next >= static_cast<int>(work.size()) ||
+                work[static_cast<size_t>(selected)].priority !=
+                    work[static_cast<size_t>(next)].priority)
                 return TRUE;
             std::swap(work[static_cast<size_t>(selected)],
                       work[static_cast<size_t>(next)]);
             changed = true;
             RefreshRuleList(dialog, work, next);
+            UpdateRuleButtons(dialog, work);
             return TRUE;
         }
         case IDOK:

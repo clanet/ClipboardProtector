@@ -5,6 +5,14 @@
 
 namespace clip {
 
+namespace {
+// SetWindowsHookEx/UnhookWindowsHookEx and the owner thread's message pump
+// are external calls; never let a wedged owner hang the controller forever.
+constexpr DWORD kInstallTimeoutMs = 10000;
+constexpr DWORD kRemoveTimeoutMs = 10000;
+constexpr DWORD kThreadExitTimeoutMs = 5000;
+} // namespace
+
 struct HookThread::State {
     HANDLE thread = nullptr;
     HANDLE stop = nullptr;
@@ -13,9 +21,11 @@ struct HookThread::State {
     HOOKPROC procedure = nullptr;
     DWORD targetThreadId = 0;
     std::atomic<DWORD> result{ERROR_SUCCESS};
+    std::atomic<bool> hookActive{false};
 #ifdef CLIP_TEST_HOOK_THREAD
     HWND window = nullptr;
     std::atomic<bool> failRemoval{false};
+    HANDLE installGate = nullptr;
 #endif
 
     ~State() {
@@ -39,6 +49,14 @@ DWORD HookThread::Install(HOOKPROC procedure, HMODULE module, DWORD targetThread
     }
     state->procedure = procedure;
     state->targetThreadId = targetThreadId;
+#ifdef CLIP_TEST_HOOK_THREAD
+    state->installGate = installGateForTest_;
+    installGateForTest_ = nullptr;
+    const DWORD installTimeout = installTimeoutForTest_;
+    installTimeoutForTest_ = kInstallTimeoutMs;
+#else
+    const DWORD installTimeout = kInstallTimeoutMs;
+#endif
     // The worker owns a reference even if a failed unhook outlives its caller.
     if (module && !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
                                     reinterpret_cast<LPCWSTR>(module),
@@ -57,13 +75,23 @@ DWORD HookThread::Install(HOOKPROC procedure, HMODULE module, DWORD targetThread
         return error;
     }
     state_ = std::move(state);
-    if (WaitForSingleObject(state_->completed, INFINITE) != WAIT_OBJECT_0)
-        return GetLastError();
+    if (WaitForSingleObject(state_->completed, installTimeout) !=
+        WAIT_OBJECT_0) {
+        // The owner thread may still be inside SetWindowsHookEx. Keep state_
+        // so the destructor/Remove can retry, but report a bounded failure.
+        return WAIT_TIMEOUT;
+    }
     const DWORD result = state_->result.load(std::memory_order_acquire);
     if (result != ERROR_SUCCESS) {
-        WaitForSingleObject(state_->thread, INFINITE);
-        state_.reset();
-        return result;
+        // The thread normally exits immediately after reporting failure. If it
+        // is wedged, keep state_ and report WAIT_TIMEOUT so the caller retains
+        // its module reference instead of freeing code the thread may use.
+        if (WaitForSingleObject(state_->thread, kThreadExitTimeoutMs) ==
+            WAIT_OBJECT_0) {
+            state_.reset();
+            return result;
+        }
+        return WAIT_TIMEOUT;
     }
     installed_.store(true, std::memory_order_release);
     return ERROR_SUCCESS;
@@ -71,12 +99,31 @@ DWORD HookThread::Install(HOOKPROC procedure, HMODULE module, DWORD targetThread
 
 DWORD HookThread::Remove() {
     if (!state_) return ERROR_SUCCESS;
+    auto clearExited = [&] {
+        installed_.store(false, std::memory_order_release);
+        state_.reset();
+        return ERROR_SUCCESS;
+    };
+    // Install may have timed out and its owner failed later. Thread completion
+    // is durable; completed is auto-reset and may already have been consumed.
+    if (WaitForSingleObject(state_->thread, 0) == WAIT_OBJECT_0)
+        return clearExited();
     if (!SetEvent(state_->stop)) return GetLastError();
-    if (WaitForSingleObject(state_->completed, INFINITE) != WAIT_OBJECT_0)
-        return GetLastError();
+    HANDLE waits[2] = {state_->thread, state_->completed};
+    const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, kRemoveTimeoutMs);
+    if (wait == WAIT_OBJECT_0) return clearExited();
+    if (wait != WAIT_OBJECT_0 + 1)
+        return wait == WAIT_FAILED ? GetLastError() : WAIT_TIMEOUT;
+    // A late install failure reports an error before returning from Run. It
+    // has no hook to remove. Only a live owner with a real hook can require a
+    // retry after UnhookWindowsHookEx fails.
     const DWORD result = state_->result.load(std::memory_order_acquire);
-    if (result != ERROR_SUCCESS) return result;
-    WaitForSingleObject(state_->thread, INFINITE);
+    if (state_->hookActive.load(std::memory_order_acquire) &&
+        result != ERROR_SUCCESS)
+        return result;
+    if (WaitForSingleObject(state_->thread, kThreadExitTimeoutMs) !=
+        WAIT_OBJECT_0)
+        return WAIT_TIMEOUT;
     installed_.store(false, std::memory_order_release);
     state_.reset();
     return ERROR_SUCCESS;
@@ -90,8 +137,12 @@ DWORD WINAPI HookThread::Run(void* argument) {
     trace.Open(L"hook-owner", state->module);
     MSG message;
     PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE);
+#ifdef CLIP_TEST_HOOK_THREAD
+    if (state->installGate) WaitForSingleObject(state->installGate, INFINITE);
+#endif
     HHOOK hook = SetWindowsHookExW(WH_GETMESSAGE, state->procedure,
                                  state->module, state->targetThreadId);
+    state->hookActive.store(hook != nullptr, std::memory_order_release);
     state->result.store(hook ? ERROR_SUCCESS : GetLastError(),
                         std::memory_order_release);
 #ifdef CLIP_TEST_HOOK_THREAD
@@ -111,6 +162,8 @@ DWORD WINAPI HookThread::Run(void* argument) {
 #endif
             if (!UnhookWindowsHookEx(hook)) error = GetLastError();
             trace.Mark("UnhookWindowsHookEx.end", 0, error);
+            if (error == ERROR_SUCCESS)
+                state->hookActive.store(false, std::memory_order_release);
             state->result.store(error,
                                 std::memory_order_release);
             SetEvent(state->completed);
@@ -134,6 +187,13 @@ DWORD WINAPI HookThread::Run(void* argument) {
 #ifdef CLIP_TEST_HOOK_THREAD
 HWND HookThread::windowForTest() const { return state_ ? state_->window : nullptr; }
 void HookThread::failNextRemovalForTest() { state_->failRemoval.store(true); }
+void HookThread::delayNextInstallForTest(HANDLE gate, DWORD timeout) {
+    installGateForTest_ = gate;
+    installTimeoutForTest_ = timeout;
+}
+bool HookThread::waitForOwnerExitForTest(DWORD timeout) const {
+    return state_ && WaitForSingleObject(state_->thread, timeout) == WAIT_OBJECT_0;
+}
 #endif
 
 } // namespace clip

@@ -9,7 +9,7 @@ Monitor clipboard access on Windows and allow, block or ask about access using p
 ## Features
 
 - Clipboard access log, filters, details and CSV export.
-- Ordered rules for process names/paths, source processes, read/write operations, formats and text patterns. New rules go to the top and match first.
+- Ordered rules for process names/paths, source processes, read/write operations, formats and text patterns. A per-rule priority of 0-9 (0 matches first) orders rules before list order; new rules go to the front of their priority group. Remembered confirmation decisions use priority 0 and move to the front of that group.
 - Allow, block or ask for each access, with independent notification and log visibility settings.
 - Copy/paste shortcut operations bypass ordinary rules by default and remain logged; an existing explicit off setting is preserved.
 - BTC / ETH / SOL address protection, enabled by default for new configurations. An independent clipboard monitor logs address changes and displays tray alerts; injected processes also support replacement blocking.

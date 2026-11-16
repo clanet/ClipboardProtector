@@ -85,9 +85,39 @@ bool QueryArchitecture(HANDLE process,
 } // namespace
 
 CoverageMonitor::~CoverageMonitor() {
-    Pause();
+    Join();
     if (stopEvent_) CloseHandle(stopEvent_);
 }
+
+void CoverageMonitor::Join() {
+    if (!thread_) return;
+    SetEvent(stopEvent_);
+    // Pause is bounded for ordinary switches. The owning object's final join
+    // cannot abandon a worker that still dereferences this or server_. Final
+    // exit already runs on the protection worker, away from the UI thread.
+#ifdef CLIP_TEST_COVERAGE_MONITOR
+    if (testJoining_) SetEvent(testJoining_);
+#endif
+    WaitForSingleObject(thread_, INFINITE);
+    CloseHandle(thread_);
+    thread_ = nullptr;
+    running_.store(false, std::memory_order_release);
+}
+
+#ifdef CLIP_TEST_COVERAGE_MONITOR
+bool CoverageMonitor::StartBlockedForTest(HANDLE entered, HANDLE resume,
+                                           HANDLE joining) {
+    if (thread_) return false;
+    testEntered_ = entered;
+    testResume_ = resume;
+    testJoining_ = joining;
+    stopEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!stopEvent_) return false;
+    thread_ = CreateThread(nullptr, 0, ThreadStatic, this, 0, nullptr);
+    running_.store(thread_ != nullptr, std::memory_order_release);
+    return thread_ != nullptr;
+}
+#endif
 
 bool CoverageMonitor::LoadCurrentUserSid() {
     ScopedHandle token;
@@ -136,7 +166,8 @@ bool CoverageMonitor::Start(PipeServer& server,
                             const std::wstring& nativeDllPath,
                             const std::wstring& helper32Path,
                             const std::wstring& dll32Path) {
-    if (thread_) return true;
+    if (running_.load(std::memory_order_acquire)) return true;
+    if (!ReapStaleThread()) return false;
     if (nativeDllPath.empty() || !LoadCurrentUserSid()) return false;
     server_ = &server;
     nativeDllPath_ = nativeDllPath;
@@ -149,35 +180,51 @@ bool CoverageMonitor::Start(PipeServer& server,
 }
 
 bool CoverageMonitor::Pause() {
-    if (!thread_) return true;
+    if (!thread_) {
+        running_.store(false, std::memory_order_release);
+        return true;
+    }
     SetEvent(stopEvent_);
-    // 有界等待：巡检线程可能正阻塞在一次远程调用里（最长约 20s）。退出
-    // 或切换保护时不能被它无限拖住；超时后线程会自行观察到停止事件并
-    // 退出，Resume() 会先回收旧线程再重建。
-    const DWORD wait = WaitForSingleObject(thread_, 3000);
+    // 远程调用现在同时等待 stopEvent_，正常情况下 3 s 足够；超时则保留
+    // 线程句柄，并让 running() 保持 true，Start/Resume 不会误报已重启。
+#ifdef CLIP_TEST_COVERAGE_MONITOR
+    const DWORD timeout = testResume_ ? 10 : 3000;
+#else
+    constexpr DWORD timeout = 3000;
+#endif
+    const DWORD wait = WaitForSingleObject(thread_, timeout);
     if (wait != WAIT_OBJECT_0) return false;
     CloseHandle(thread_);
     thread_ = nullptr;
+    running_.store(false, std::memory_order_release);
+    return true;
+}
+
+bool CoverageMonitor::ReapStaleThread() {
+    if (!thread_) {
+        running_.store(false, std::memory_order_release);
+        return true;
+    }
+    if (WaitForSingleObject(thread_, 0) != WAIT_OBJECT_0) return false;
+    CloseHandle(thread_);
+    thread_ = nullptr;
+    running_.store(false, std::memory_order_release);
     return true;
 }
 
 bool CoverageMonitor::Resume() {
-    // 上一次 Pause 超时后旧线程可能仍在收尾；先等它退出，避免出现两个
-    // 巡检线程同时遍历 entries_。
-    if (thread_) {
-        if (WaitForSingleObject(thread_, 2000) != WAIT_OBJECT_0) return true;
-        CloseHandle(thread_);
-        thread_ = nullptr;
-    }
+    if (running_.load(std::memory_order_acquire)) return true;
+    if (!ReapStaleThread()) return false;
     if (!server_ || !stopEvent_ || !ResetEvent(stopEvent_)) return false;
     thread_ = CreateThread(nullptr, 0, ThreadStatic, this, 0, nullptr);
+    running_.store(thread_ != nullptr, std::memory_order_release);
     return thread_ != nullptr;
 }
 
 void CoverageMonitor::Clear() {
-    if (thread_) return;
+    if (!ReapStaleThread()) return;
     for (auto it = entries_.begin(); it != entries_.end();) {
-        if (!it->second.retainedReference)
+        if (!it->second.retainedReference && !it->second.abandonedReference)
             it = entries_.erase(it);
         else
             ++it;
@@ -190,6 +237,7 @@ DWORD WINAPI CoverageMonitor::ThreadStatic(LPVOID parameter) {
         return self->ThreadNoThrow();
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
+        self->running_.store(false, std::memory_order_release);
         return GetExceptionCode();
     }
 }
@@ -198,11 +246,20 @@ DWORD CoverageMonitor::ThreadNoThrow() noexcept {
     try {
         return ThreadBody();
     } catch (...) {
+        running_.store(false, std::memory_order_release);
         return ERROR_UNHANDLED_EXCEPTION;
     }
 }
 
 DWORD CoverageMonitor::ThreadBody() {
+#ifdef CLIP_TEST_COVERAGE_MONITOR
+    if (testResume_) {
+        SetEvent(testEntered_);
+        WaitForSingleObject(testResume_, INFINITE);
+        running_.store(false, std::memory_order_release);
+        return 0;
+    }
+#endif
     do {
         try {
             Scan();
@@ -211,6 +268,7 @@ DWORD CoverageMonitor::ThreadBody() {
             // future coverage sweeps.
         }
     } while (WaitForSingleObject(stopEvent_, kScanIntervalMs) == WAIT_TIMEOUT);
+    running_.store(false, std::memory_order_release);
     return 0;
 }
 
@@ -353,15 +411,14 @@ void CoverageMonitor::Scan() {
     for (size_t index = 0; index < count; ++index) {
         if (WaitForSingleObject(stopEvent_, 0) == WAIT_OBJECT_0) break;
         Entry& entry = *candidates[index];
-        // 已有未平衡的引用（例如冻结进程里超时的 LoadLibrary）时只尝试启动已加载的模块，
-        // 不再每次退避重试都追加远程线程和缓冲区；十分钟后仍未加载则视为上次加载
-        // 已失败，允许重新加载一次，避免该进程永久失去覆盖。
-        constexpr ULONGLONG kReloadAfterRetainedMs = 10ull * 60 * 1000;
-        const bool allowLoad = !entry.retainedReference ||
-            GetTickCount64() - entry.retainedSince >= kReloadAfterRetainedMs;
+        // One unresolved load owns at most one balancing release. A frozen
+        // loader can finish after any elapsed time, so never replace it with a
+        // second load merely because a backoff interval expired.
+        const bool allowLoad = !entry.retainedReference &&
+                               !entry.abandonedReference;
         const bool retainedReference = StartTarget(entry, allowLoad);
-        if (retainedReference && allowLoad) entry.retainedSince = GetTickCount64();
-        if (retainedReference && !entry.retainedReference) {
+        if (retainedReference && !entry.retainedReference &&
+            !entry.abandonedReference) {
             entry.retainedReference = true;
             entry.releaseAttempts = 0;
             entry.nextReleaseAttempt =
@@ -372,24 +429,49 @@ void CoverageMonitor::Scan() {
     }
 }
 
-bool CoverageMonitor::StartTarget(const Entry& entry, bool allowLoad) {
+bool CoverageMonitor::StartTarget(Entry& entry, bool allowLoad) {
 #ifdef _WIN64
     if (entry.architecture == Architecture::x86) {
         DWORD exitCode = kRemoteHelperFailed;
-        if (!Run32BitHelper(allowLoad ? L"--remote-start" : L"--remote-start-loaded",
-                            entry, exitCode))
-            return exitCode == WAIT_TIMEOUT;
+        bool launched = false;
+        const bool completed = Run32BitHelper(
+            allowLoad ? L"--remote-start" : L"--remote-start-loaded",
+            entry, exitCode, launched);
+        const bool knownResult = exitCode == kRemoteHelperStarted ||
+            exitCode == kRemoteHelperStartedRetained ||
+            exitCode == kRemoteHelperFailedRetained ||
+            exitCode == kRemoteHelperFailed ||
+            exitCode == kRemoteHelperStartedSubmitted ||
+            exitCode == kRemoteHelperFailedSubmitted;
+        if (!completed || !knownResult) {
+            if (launched) {
+                // The helper could have loaded and already submitted its
+                // balancing release before cancellation. No further release
+                // or load is safe without its result; start-loaded can still
+                // restore protection using a module that is already present.
+                entry.abandonedReference = true;
+                entry.retainedReference = false;
+            }
+            return false;
+        }
+        if (exitCode == kRemoteHelperStartedSubmitted ||
+            exitCode == kRemoteHelperFailedSubmitted)
+            entry.abandonedReference = true;
         return exitCode == kRemoteHelperStartedRetained ||
                exitCode == kRemoteHelperFailedRetained;
     }
 #endif
     const RemoteHookStartResult result = RemoteHookStart(
-        entry.processId, entry.creationTime, nativeDllPath_, allowLoad);
+        entry.processId, entry.creationTime, nativeDllPath_, allowLoad,
+        stopEvent_);
+    if (result.releaseSubmitted) entry.abandonedReference = true;
     return result.retainedReference;
 }
 
 bool CoverageMonitor::Run32BitHelper(const wchar_t* command,
-                                     const Entry& entry, DWORD& exitCode) {
+                                     const Entry& entry, DWORD& exitCode,
+                                     bool& launched) {
+    launched = false;
 #ifdef _WIN64
     std::wstring commandLine = L"\"" + helper32Path_ + L"\" " + command +
                                L" " + std::to_wstring(entry.processId) +
@@ -403,6 +485,7 @@ bool CoverageMonitor::Run32BitHelper(const wchar_t* command,
         exitCode = GetLastError();
         return false;
     }
+    launched = true;
     CloseHandle(process.hThread);
     // 同时等待停止事件：退出流程不再被这里最长 20s 的等待拖住。
     HANDLE waits[2] = {process.hProcess, stopEvent_};
@@ -428,21 +511,36 @@ bool CoverageMonitor::Run32BitHelper(const wchar_t* command,
 #endif
 }
 
-bool CoverageMonitor::ReleaseTarget(const Entry& entry) {
+bool CoverageMonitor::ReleaseTarget(Entry& entry) {
 #ifdef _WIN64
     if (entry.architecture == Architecture::x86) {
         DWORD exitCode = kRemoteHelperFailed;
-        return Run32BitHelper(L"--remote-release", entry, exitCode) &&
-               exitCode == kRemoteHelperStarted;
+        bool launched = false;
+        const bool completed = Run32BitHelper(L"--remote-release", entry,
+                                               exitCode, launched);
+        // An exited/killed helper cannot carry its remote-thread identity
+        // across the next helper invocation. Once launched, an unknown result
+        // therefore consumes this release rather than risking a second one.
+        if (launched && (!completed ||
+                         (exitCode != kRemoteHelperFailed &&
+                          exitCode != kRemoteHelperStarted)))
+            entry.abandonedReference = true;
+        return completed ? exitCode != kRemoteHelperFailed : launched;
     }
 #endif
     DWORD error = ERROR_SUCCESS;
-    return RemoteHookRelease(entry.processId, entry.creationTime,
-                             nativeDllPath_, error);
+    const RemoteHookReleaseState result = RemoteHookRelease(
+        entry.processId, entry.creationTime, nativeDllPath_, error, stopEvent_);
+    if (result == RemoteHookReleaseState::submitted)
+        entry.abandonedReference = true;
+    return result != RemoteHookReleaseState::retryable;
 }
 
 void CoverageMonitor::ReleaseRetainedReferences() {
-    if (thread_) return;
+    if (!ReapStaleThread()) return;
+    // Pause() set stopEvent_; the release phase is still part of shutdown,
+    // so clear it to allow the bounded remote FreeLibrary calls to run.
+    if (stopEvent_) ResetEvent(stopEvent_);
     ShutdownTrace trace;
     trace.Open(L"coverage-release");
     // 每次释放是一次远程 FreeLibrary（卡在加载器锁的宿主上最多 5s）。
@@ -459,9 +557,12 @@ void CoverageMonitor::ReleaseRetainedReferences() {
                 return;
             }
             trace.Mark("coverage.target_release.begin", entry.processId);
-            const bool released = ReleaseTarget(entry);
-            trace.Mark(released ? "coverage.target_release.ok" : "coverage.target_release.failed", entry.processId);
-            if (released)
+            const bool consumed = ReleaseTarget(entry);
+            trace.Mark(consumed ? (entry.abandonedReference
+                                      ? "coverage.target_release.submitted"
+                                      : "coverage.target_release.ok")
+                                : "coverage.target_release.failed", entry.processId);
+            if (consumed)
                 entry.retainedReference = false;
             else
                 pending = true;

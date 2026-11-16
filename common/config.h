@@ -2,6 +2,8 @@
 // 配置模型与读写。存储位置：%APPDATA%\ClipboardProtector\config.json
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <utility>
 #include "hotkeys.h"
 #include "i18n.h"
 
@@ -49,6 +51,10 @@ enum RuleFormat : unsigned char {
     kFormatPrivateKeyMnemonic = 4,
 };
 
+constexpr int kMinRulePriority = 0;   // 0 matches first
+constexpr int kMaxRulePriority = 9;
+constexpr int kDefaultRulePriority = 5;
+
 constexpr unsigned int kDefaultShortcutAuthorizationWindowMs = 1000;
 constexpr unsigned int kMinShortcutAuthorizationWindowMs = 100;
 constexpr unsigned int kMaxShortcutAuthorizationWindowMs = 5000;
@@ -90,7 +96,38 @@ struct Rule {
     std::wstring sourcePattern;
     unsigned int confirmTimeoutMs = 15000;
     bool timeoutBlock = true;
+    unsigned char priority = kDefaultRulePriority;
 };
+
+// Rules match top-to-bottom. Keep stored rules sorted by ascending priority
+// (0 first) and preserve insertion order within a priority. Returns a map from
+// each rule's old index to its new index for list selection.
+inline std::vector<size_t> SortRulesByPriority(std::vector<Rule>& rules) {
+    std::vector<size_t> order(rules.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&rules](size_t a, size_t b) {
+                         return rules[a].priority < rules[b].priority;
+                     });
+    std::vector<size_t> newIndex(rules.size());
+    std::vector<Rule> sorted;
+    sorted.reserve(rules.size());
+    for (size_t next = 0; next < order.size(); ++next) {
+        newIndex[order[next]] = next;
+        sorted.push_back(std::move(rules[order[next]]));
+    }
+    rules = std::move(sorted);
+    return newIndex;
+}
+
+// Requires rules already sorted by SortRulesByPriority. Returns the first slot
+// of the priority group so an inserted rule precedes equal-priority rules.
+inline size_t RulePriorityGroupBegin(const std::vector<Rule>& rules,
+                                     unsigned char priority) {
+    size_t index = 0;
+    while (index < rules.size() && rules[index].priority < priority) ++index;
+    return index;
+}
 
 struct Config {
     Settings settings;

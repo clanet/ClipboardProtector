@@ -32,6 +32,11 @@ struct RemoteFunction {
 
 enum class RemoteCallState { completed, timedOut, failed };
 
+#ifdef CLIP_TEST_REMOTE_HOOK
+LPTHREAD_START_ROUTINE g_testRelease = nullptr;
+DWORD g_testReleaseTimeout = 5000;
+#endif
+
 void NormalizePath(std::wstring& path) {
     std::replace(path.begin(), path.end(), L'/', L'\\');
     if (path.rfind(L"\\\\?\\UNC\\", 0) == 0)
@@ -214,7 +219,14 @@ bool OpenValidatedProcess(DWORD processId, ULONGLONG expectedCreationTime,
 
 RemoteCallState CallRemote(HANDLE process,
                            LPTHREAD_START_ROUTINE function, void* parameter,
-                           DWORD timeout, DWORD& result, DWORD& error) {
+                           DWORD timeout, DWORD& result, DWORD& error,
+                           HANDLE stopEvent = nullptr,
+                           bool* submitted = nullptr) {
+    if (submitted) *submitted = false;
+    if (stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) {
+        error = WAIT_TIMEOUT;
+        return RemoteCallState::failed;
+    }
     ScopedHandle thread;
     thread.value = CreateRemoteThread(process, nullptr, 0, function, parameter,
                                       0, nullptr);
@@ -222,14 +234,19 @@ RemoteCallState CallRemote(HANDLE process,
         error = GetLastError();
         return RemoteCallState::failed;
     }
-    const DWORD wait = WaitForSingleObject(thread.value, timeout);
-    if (wait == WAIT_TIMEOUT) {
+    if (submitted) *submitted = true;
+    HANDLE waits[2] = {thread.value, stopEvent};
+    const DWORD wait = WaitForMultipleObjects(stopEvent ? 2 : 1, waits, FALSE,
+                                              timeout);
+    if (wait == WAIT_TIMEOUT || wait == WAIT_OBJECT_0 + 1) {
         error = WAIT_TIMEOUT;
         return RemoteCallState::timedOut;
     }
     if (wait != WAIT_OBJECT_0 || !GetExitCodeThread(thread.value, &result)) {
         error = wait == WAIT_FAILED ? GetLastError() : ERROR_FUNCTION_FAILED;
-        return RemoteCallState::failed;
+        // The thread was created and may still access its parameter. A failed
+        // wait/result query cannot turn it into an operation safe to resubmit.
+        return RemoteCallState::timedOut;
     }
     error = ERROR_SUCCESS;
     return RemoteCallState::completed;
@@ -270,37 +287,58 @@ bool ResolveStartOffset(const std::wstring& dllPath, ULONG_PTR& offset,
     return true;
 }
 
-bool ReleaseOneReference(HANDLE process,
+RemoteHookReleaseState ReleaseOneReference(HANDLE process,
                          const std::vector<ModuleRecord>& modules,
-                         const ModuleRecord& target, DWORD& error) {
+                         const ModuleRecord& target, DWORD& error,
+                         HANDLE stopEvent) {
     RemoteFunction freeLibrary;
     LPTHREAD_START_ROUTINE remoteFree = nullptr;
     if (!ResolveSystemFunction("FreeLibrary", freeLibrary) ||
         !ResolveRemoteSystemFunction(modules, freeLibrary, remoteFree)) {
         error = ERROR_PROC_NOT_FOUND;
-        return false;
+        return RemoteHookReleaseState::retryable;
     }
+    DWORD timeout = 5000;
+#ifdef CLIP_TEST_REMOTE_HOOK
+    if (g_testRelease) remoteFree = g_testRelease;
+    timeout = g_testReleaseTimeout;
+#endif
     DWORD result = 0;
+    bool submitted = false;
     const RemoteCallState state = CallRemote(
-        process, remoteFree, reinterpret_cast<void*>(target.base), 5000,
-        result, error);
+        process, remoteFree, reinterpret_cast<void*>(target.base), timeout,
+        result, error, stopEvent, &submitted);
+    if (!submitted) return RemoteHookReleaseState::retryable;
     if (state != RemoteCallState::completed || result == 0) {
         if (state == RemoteCallState::completed) error = ERROR_DLL_INIT_FAILED;
-        return false;
+        // Prefer a possible leaked reference over decrementing another owner's
+        // reference when this thread eventually passes the target loader lock.
+        return RemoteHookReleaseState::submitted;
     }
     error = ERROR_SUCCESS;
-    return true;
+    return RemoteHookReleaseState::released;
 }
 
 } // namespace
 
+#ifdef CLIP_TEST_REMOTE_HOOK
+void RemoteHookReleaseForTest(LPTHREAD_START_ROUTINE function, DWORD timeout) {
+    g_testRelease = function;
+    g_testReleaseTimeout = timeout;
+}
+#endif
+
 RemoteHookStartResult RemoteHookStart(DWORD processId,
                                       ULONGLONG expectedCreationTime,
                                       const std::wstring& dllPath,
-                                      bool allowLoad) {
+                                      bool allowLoad, HANDLE stopEvent) {
     RemoteHookStartResult result;
     if (processId == 0 || expectedCreationTime == 0 || dllPath.empty()) {
         result.error = ERROR_INVALID_PARAMETER;
+        return result;
+    }
+    if (stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) {
+        result.error = WAIT_TIMEOUT;
         return result;
     }
     std::wstring fullDllPath;
@@ -362,7 +400,7 @@ RemoteHookStartResult RemoteHookStart(DWORD processId,
         DWORD loadResult = 0;
         const RemoteCallState loadState = CallRemote(
             process.value, remoteLoad, remotePath, 5000, loadResult,
-            result.error);
+            result.error, stopEvent);
         if (loadState != RemoteCallState::timedOut)
             VirtualFreeEx(process.value, remotePath, 0, MEM_RELEASE);
         if (loadState != RemoteCallState::completed) {
@@ -393,7 +431,7 @@ RemoteHookStartResult RemoteHookStart(DWORD processId,
             process.value,
             reinterpret_cast<LPTHREAD_START_ROUTINE>(remoteModule->base +
                                                        startOffset),
-            nullptr, 5000, startResult, result.error);
+            nullptr, 5000, startResult, result.error, stopEvent);
         if (startState == RemoteCallState::completed && startResult != 0) {
             result.started = true;
             result.error = ERROR_SUCCESS;
@@ -409,26 +447,32 @@ RemoteHookStartResult RemoteHookStart(DWORD processId,
 
     if (addedReference) {
         DWORD releaseError = ERROR_SUCCESS;
-        if (!ReleaseOneReference(process.value, modules, *remoteModule,
-                                 releaseError)) {
-            result.retainedReference = true;
-            if (result.started) result.error = releaseError;
-        }
+        const RemoteHookReleaseState release = ReleaseOneReference(
+            process.value, modules, *remoteModule, releaseError, stopEvent);
+        result.retainedReference = release == RemoteHookReleaseState::retryable;
+        result.releaseSubmitted = release == RemoteHookReleaseState::submitted;
+        if (release != RemoteHookReleaseState::released && result.started)
+            result.error = releaseError;
     }
     return result;
 }
 
-bool RemoteHookRelease(DWORD processId, ULONGLONG expectedCreationTime,
-                       const std::wstring& dllPath, DWORD& error) {
+RemoteHookReleaseState RemoteHookRelease(DWORD processId, ULONGLONG expectedCreationTime,
+                       const std::wstring& dllPath, DWORD& error,
+                       HANDLE stopEvent) {
     error = ERROR_SUCCESS;
     if (processId == 0 || expectedCreationTime == 0 || dllPath.empty()) {
         error = ERROR_INVALID_PARAMETER;
-        return false;
+        return RemoteHookReleaseState::retryable;
+    }
+    if (stopEvent && WaitForSingleObject(stopEvent, 0) == WAIT_OBJECT_0) {
+        error = WAIT_TIMEOUT;
+        return RemoteHookReleaseState::retryable;
     }
     std::wstring fullDllPath;
     if (!FullPath(dllPath, fullDllPath)) {
         error = ERROR_INVALID_NAME;
-        return false;
+        return RemoteHookReleaseState::retryable;
     }
     constexpr DWORD access = PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION |
                              PROCESS_VM_WRITE | PROCESS_VM_READ |
@@ -436,16 +480,19 @@ bool RemoteHookRelease(DWORD processId, ULONGLONG expectedCreationTime,
     ScopedHandle process;
     if (!OpenValidatedProcess(processId, expectedCreationTime, access, process,
                               error))
-        return error == ERROR_PROCESS_ABORTED;
+        return error == ERROR_PROCESS_ABORTED ? RemoteHookReleaseState::released
+                                              : RemoteHookReleaseState::retryable;
 
     std::vector<ModuleRecord> modules;
-    if (!SnapshotModules(processId, modules, error)) return false;
+    if (!SnapshotModules(processId, modules, error))
+        return RemoteHookReleaseState::retryable;
     const ModuleRecord* target = FindModuleByPath(modules, fullDllPath);
     if (!target) {
         error = ERROR_SUCCESS;
-        return true;
+        return RemoteHookReleaseState::released;
     }
-    return ReleaseOneReference(process.value, modules, *target, error);
+    return ReleaseOneReference(process.value, modules, *target, error,
+                               stopEvent);
 }
 
 } // namespace clip

@@ -15,7 +15,7 @@
 - Remove host heap locking from Detours transactions. Use fixed transaction-node storage and preallocated native thread snapshots while threads are suspended; abort preparation when the time budget or storage limit is exceeded. Add heap-owner and partial-freeze rollback regressions.
 - Limit host thread suspension to Detours transactions, check module release safety during detach, and acknowledge shutdown before waiting for in-flight calls. Retain the DLL reference when immediate unloading is unsafe instead of suspending the host again.
 - Enable Crypto address protection by default while preserving existing explicit off settings. Independently monitor clipboard address changes and report them through redacted logs and tray notifications, including changes made by uninjected processes. Observed changes are not reported as blocked.
-- Insert new rules at the top of the list, including rules added from access logs.
+- Add per-rule priority 0-9 (0 matches first). Rules match by priority, then list order; new rules, including rules added from access logs, go to the front of their priority group. Existing configurations keep their order with priority 5.
 - Enable "Allow copy/paste shortcuts without checking rules" by default while preserving existing explicit off settings.
 - Add "Silent non-text reads and writes" and "Clipboard read and write notifications" when creating the first configuration. Preserve existing configurations and deliberately emptied rule lists.
 - 推送版本标签后，GitHub Actions 自动构建并发布 ZIP；alpha 等版本自动标记为预发布。ZIP 仅含四个运行组件和中英文 README，许可文本合并到英文 README，SHA-256 文件仅用于发布流程内部核验。
@@ -23,6 +23,14 @@
 - 修复 Base58 格式识别误接受内嵌空字符的问题。
 - 统一 IPC 版本协商解析与窗口绘图辅助函数，简化字符串反序列化，并补充协议边界测试。
 - 注入压力测试改为等待线程就绪，保留调用量断言，增加失败诊断和整体超时余量。
+- 修复首次能力协商的扩展规则重发竞态；服务端析构等待所属线程退出，普通停止操作继续使用有界等待。
+- 区分远程模块释放的“未提交、已提交、已完成”，超时或取消等待后不再重复减引用；修复 Hook 安装超时后晚失败导致无法再次开启保护的问题。
+- 巡检暂停失败时保留现有保护状态；退出先等待保护操作和巡检收尾，再销毁管道及其依赖。
+- 通配符工作预算耗尽后不再绕过后续阻止规则；确认窗口记忆的规则统一使用优先级 0 组首，并正确更新已有组首规则。
+- 修复输入前取消误触发私有隔离，以及私有会话延迟卸钩与下一会话交错的问题；保留进程内多 GUI 线程切换。
+- 在剪贴板锁内发布来源序列号，避免将后续写入归到前一进程；按 `CF_LOCALE` 解码 ANSI 文本。
+- 保留独立 Crypto 阻止事件；无内容指纹的事件不按相同内容合并，日志去重不再丢失上游事件缺口计数。
+- CA13 协商确认请求的绝对截止时间，界面排队不再延长请求，过期请求和迟到决策不再保存记忆规则。
 - Windows 剪贴板访问日志、规则、通知及交互确认。
 - 会话级单进程保护、可选全局注入与 x86/x64 覆盖组件。
 - 快捷键授权、配置持久化、CSV 导出及托盘管理。

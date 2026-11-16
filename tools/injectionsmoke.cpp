@@ -39,6 +39,11 @@ enum Command : LONG {
     kCommandCopyText = 21,
     kCommandReadText = 22,
     kCommandClearClipboard = 23,
+    kCommandLocaleFirst = 24,
+    kCommandLocaleLast = 25,
+    kCommandCloseBarrier = 26,
+    kCommandConfirmationBarrier = 27,
+    kCommandWaitWorkerStopped = 28,
 };
 
 struct SharedState {
@@ -51,6 +56,10 @@ struct SharedState {
     volatile LONG stressThreadsCreated = 0;
     volatile LONG stressThreadFailures = 0;
     volatile LONG stressWorkers = 0;
+    LCID locale = 0x0419;
+    UINT codePage = 0;
+    UINT defaultCodePage = 0;
+    ULONG_PTR barrierEntered = 0, barrierResume = 0;
     wchar_t text[clip::kMaxCryptoTextLength + 2] = {};
 };
 
@@ -72,6 +81,7 @@ struct PipeEvent {
     std::wstring preview;
     bool gap = false;
     unsigned long long missingEvents = 0;
+    DWORD sequence = 0;
     DWORD sourcePid = 0;
     std::wstring sourceName;
     std::wstring sourcePath;
@@ -136,8 +146,7 @@ bool ParseEventPayload(const char* data, size_t size, PipeEvent& event) {
         (event.hash & clip::kEventCryptoContentFlag) != 0;
     event.hash &= ~clip::kEventCryptoContentFlag;
     if (reader.n != 0) {
-        DWORD sequence = 0;
-        if (!reader.GetU32(sequence) || !reader.GetU32(event.sourcePid) ||
+        if (!reader.GetU32(event.sequence) || !reader.GetU32(event.sourcePid) ||
             !reader.GetWStr(event.sourceName) ||
             !reader.GetWStr(event.sourcePath) ||
             !reader.GetWStr(event.ruleName))
@@ -216,6 +225,41 @@ bool ReadEvent(HANDLE pipe, PipeEvent& event, DWORD timeoutMs,
                ParseEventPayload(payload.data(), payload.size(), event);
     }
     return false;
+}
+
+struct ConfirmationFrame {
+    unsigned long long token = 0, deadline = 0;
+    DWORD timeoutMs = 0;
+};
+
+bool ReadConfirmation(HANDLE pipe, ConfirmationFrame& request, DWORD timeoutMs) {
+    const ULONGLONG until = GetTickCount64() + timeoutMs;
+    for (;;) {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= until || !WaitForPipeData(pipe, static_cast<DWORD>(until - now))) return false;
+        BYTE header[6] = {};
+        if (!ReadExact(pipe, header, sizeof(header)) || header[1] != clip::kIpcVersion) return false;
+        const DWORD size = static_cast<DWORD>(header[2]) | (static_cast<DWORD>(header[3]) << 8) |
+            (static_cast<DWORD>(header[4]) << 16) | (static_cast<DWORD>(header[5]) << 24);
+        if (size > clip::kIpcMaxPayload) return false;
+        std::string payload(size, '\0');
+        if (size && !ReadExact(pipe, payload.data(), size)) return false;
+        if (header[0] == clip::kIpcStateAck) {
+            clip::StateAck ack;
+            if (!clip::ParseStateAck(payload.data(), payload.size(), ack) || ack.version != 13) return false;
+            continue;
+        }
+        if (header[0] != clip::kIpcConfirmRequest) return false;
+        clip::Reader reader(payload.data(), payload.size());
+        BYTE operation = 0, timeoutBlock = 0;
+        DWORD format = 0, sourcePid = 0;
+        std::wstring text;
+        return reader.GetU64(request.token) && reader.GetU8(operation) &&
+            reader.GetU32(format) && reader.GetU32(sourcePid) &&
+            reader.GetWStr(text) && reader.GetWStr(text) && reader.GetWStr(text) && reader.GetWStr(text) &&
+            reader.GetU32(request.timeoutMs) && reader.GetU8(timeoutBlock) && timeoutBlock == 1 &&
+            reader.GetU64(request.deadline) && reader.n == 0;
+    }
 }
 
 bool VerifyPreviewFrame() {
@@ -315,7 +359,10 @@ bool SendNotificationState(HANDLE pipe, const std::wstring& processName,
                             DWORD shortcutWindowMs =
                                 clip::kDefaultShortcutAuthorizationWindowMs,
                             int ignoreCustom = -1,
-                            bool hideFromLogList = false) {
+                            bool hideFromLogList = false,
+                            const std::wstring& contentPattern = L"",
+                            DWORD confirmTimeoutMs = 15000,
+                            bool deadlineEnabled = false) {
     std::string begin;
     clip::PutFrame(begin, clip::kIpcStateBegin);
     std::string rulesPayload;
@@ -333,12 +380,12 @@ bool SendNotificationState(HANDLE pipe, const std::wstring& processName,
         clip::PutU8(rulesPayload, hideFromLogList ? 1 : 0);
     clip::PutU8(rulesPayload, clip::kRuleReadWrite);
     clip::PutU8(rulesPayload, format);
-    clip::PutWStr(rulesPayload, L"");
+    clip::PutWStr(rulesPayload, contentPattern);
     clip::PutU8(rulesPayload, 1);
     clip::PutU8(rulesPayload, 1);
     clip::PutU8(rulesPayload, clip::kSourceAny);
     clip::PutWStr(rulesPayload, L"");
-    clip::PutU32(rulesPayload, 15000);
+    clip::PutU32(rulesPayload, confirmTimeoutMs);
     clip::PutU8(rulesPayload, 1);
     std::string rules;
     clip::PutFrame(rules, clip::kIpcRulesExtended, rulesPayload);
@@ -349,15 +396,19 @@ bool SendNotificationState(HANDLE pipe, const std::wstring& processName,
     std::string settingsPayload;
     clip::PutU8(settingsPayload, 0);
     clip::PutU8(settingsPayload, 0);
-    if (crypto >= 0 || shortcutDirectAllow >= 0 || ignoreCustom >= 0)
+    if (crypto >= 0 || shortcutDirectAllow >= 0 || ignoreCustom >= 0 || deadlineEnabled)
         clip::PutU8(settingsPayload, crypto > 0 ? 1 : 0);
-    if (shortcutDirectAllow >= 0 || ignoreCustom >= 0) {
+    if (shortcutDirectAllow >= 0 || ignoreCustom >= 0 || deadlineEnabled) {
         clip::PutU8(settingsPayload, 0);
         clip::PutU8(settingsPayload, shortcutDirectAllow > 0 ? 1 : 0);
         clip::PutU32(settingsPayload, shortcutWindowMs);
     }
-    if (ignoreCustom >= 0)
-        clip::PutU8(settingsPayload, ignoreCustom ? 1 : 0);
+    if (ignoreCustom >= 0 || deadlineEnabled)
+        clip::PutU8(settingsPayload, ignoreCustom > 0 ? 1 : 0);
+    if (deadlineEnabled) {
+        clip::PutU8(settingsPayload, 0); // CA12 text metadata remains disabled.
+        clip::PutU8(settingsPayload, 1); // CA13 absolute confirmation deadline.
+    }
     std::string settings;
     clip::PutFrame(settings, clip::kIpcSettings, settingsPayload);
     const bool sent = WriteAll(pipe, begin) && WriteAll(pipe, rules) &&
@@ -525,6 +576,9 @@ int TargetMain(int argc, wchar_t** argv) {
         MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(SharedState)));
     if (!state) return 21;
 
+    GetLocaleInfoW(MAKELCID(LOWORD(reinterpret_cast<ULONG_PTR>(GetKeyboardLayout(0))), SORT_DEFAULT),
+        LOCALE_IDEFAULTANSICODEPAGE | LOCALE_RETURN_NUMBER,
+        reinterpret_cast<LPWSTR>(&state->defaultCodePage), sizeof(state->defaultCodePage) / sizeof(wchar_t));
     MSG message;
     PeekMessageW(&message, nullptr, 0, 0, PM_NOREMOVE);
     SetEvent(readyEvent);
@@ -550,10 +604,9 @@ int TargetMain(int argc, wchar_t** argv) {
         const void* source = state->text;
         size_t bytes = (wcslen(state->text) + 1) * sizeof(wchar_t);
         if (format != CF_UNICODETEXT) {
-            const UINT codePage = format == CF_TEXT || format == CF_DSPTEXT
-                                      ? CP_ACP
-                                      : format == CF_OEMTEXT ? CP_OEMCP
-                                                             : CP_UTF8;
+            const UINT codePage = (format == CF_TEXT || format == CF_DSPTEXT)
+                                      ? (state->codePage ? state->codePage : CP_ACP)
+                                      : format == CF_OEMTEXT ? CP_OEMCP : CP_UTF8;
             const DWORD flags = codePage == CP_UTF8 ? WC_ERR_INVALID_CHARS : 0;
             const int required = WideCharToMultiByte(
                 codePage, flags, state->text, -1, nullptr, 0, nullptr,
@@ -602,6 +655,8 @@ int TargetMain(int argc, wchar_t** argv) {
         SetLastError(error);
         return reinterpret_cast<ULONG_PTR>(result);
     };
+    HWND clipboardOwner = CreateWindowExW(0, L"STATIC", L"Synthetic clipboard owner", 0,
+        0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
     bool running = true;
     while (running) {
         DWORD wait = MsgWaitForMultipleObjects(1, &commandEvent, FALSE, INFINITE,
@@ -614,6 +669,36 @@ int TargetMain(int argc, wchar_t** argv) {
             // validates the Detours/API decision path without touching the
             // user's real clipboard.  Clipboard E2E belongs to Sandbox.
             switch (command) {
+            case kCommandWaitWorkerStopped: {
+                wchar_t dllPath[32768] = {};
+                GetEnvironmentVariableW(L"CLIP_TEST_DLL_PATH", dllPath, _countof(dllPath));
+                HMODULE module = nullptr;
+                GetModuleHandleExW(0, dllPath, &module);
+                auto lifecycle = module ? reinterpret_cast<long(*)()>(
+                    GetProcAddress(module, "ClipHookLifecycleForTest")) : nullptr;
+                const ULONGLONG deadline = GetTickCount64() + 7000;
+                long observed = lifecycle ? lifecycle() : 0;
+                while ((observed & 1) && GetTickCount64() < deadline) {
+                    Sleep(10);
+                    observed = lifecycle();
+                }
+                state->value = static_cast<ULONG_PTR>(observed);
+                if (module) FreeLibrary(module);
+                SetLastError((observed & 1) ? WAIT_TIMEOUT : ERROR_SUCCESS);
+                break;
+            }
+            case kCommandCloseBarrier:
+            case kCommandConfirmationBarrier: {
+                wchar_t dllPath[32768] = {};
+                GetEnvironmentVariableW(L"CLIP_TEST_DLL_PATH", dllPath, _countof(dllPath));
+                HMODULE module = GetModuleHandleW(dllPath);
+                auto barrier = reinterpret_cast<void(*)(HANDLE,HANDLE)>(GetProcAddress(module,
+                    command == kCommandCloseBarrier ? "ClipHookCloseRaceForTest" : "ClipHookConfirmationRaceForTest"));
+                state->value = barrier ? 1 : 0;
+                if (barrier) barrier(reinterpret_cast<HANDLE>(state->barrierEntered),
+                                     reinterpret_cast<HANDLE>(state->barrierResume));
+                break;
+            }
             case kCommandGet:
                 state->value = (ULONG_PTR)GetClipboardData(state->format);
                 break;
@@ -675,18 +760,18 @@ int TargetMain(int argc, wchar_t** argv) {
             break;
         case kCommandCopyText:
         case kCommandReadText:
-        case kCommandClearClipboard: {
+        case kCommandClearClipboard:
+        case kCommandLocaleFirst:
+        case kCommandLocaleLast: {
             // The controller and target run on a private window station, so
             // these native clipboard transactions cannot touch user content.
-            HWND owner = CreateWindowExW(0, L"STATIC", L"Crypto smoke", 0,
-                                         0, 0, 0, 0, HWND_MESSAGE, nullptr,
-                                         GetModuleHandleW(nullptr), nullptr);
             state->value = 0;
             DWORD error = GetLastError();
-            if (owner && OpenClipboard(owner)) {
+            if (clipboardOwner && OpenClipboard(clipboardOwner)) {
                 if (command == kCommandReadText) {
-                    HANDLE data = GetClipboardData(CF_UNICODETEXT);
-                    if (data) {
+                    SetLastError(0x12345678u);
+                    HANDLE data = GetClipboardData(state->format);
+                    if (data && state->format == CF_UNICODETEXT) {
                         const auto* text = static_cast<const wchar_t*>(GlobalLock(data));
                         if (text) {
                             wcsncpy_s(state->text, text, _TRUNCATE);
@@ -694,15 +779,24 @@ int TargetMain(int argc, wchar_t** argv) {
                             state->value = 1;
                         }
                     }
+                    if (data && state->format != CF_UNICODETEXT) state->value = 1;
                 } else if (EmptyClipboard()) {
-                    state->value = command == kCommandCopyText ? setText() : 1;
+                    const auto locale = [&] {
+                        std::vector<BYTE> bytes(sizeof(state->locale));
+                        memcpy(bytes.data(), &state->locale, bytes.size());
+                        return setGlobalData(CF_LOCALE, bytes);
+                    };
+                    if (command == kCommandLocaleFirst) {
+                        if (locale()) state->value = setText();
+                    } else if (command == kCommandLocaleLast) {
+                        if (setText()) state->value = locale();
+                    } else state->value = command == kCommandCopyText ? setText() : 1;
                 }
                 error = GetLastError();
                 CloseClipboard();
             } else {
                 error = GetLastError();
             }
-            if (owner) DestroyWindow(owner);
             SetLastError(error);
             break;
         }
@@ -785,6 +879,7 @@ int TargetMain(int argc, wchar_t** argv) {
         }
     }
     StopTargetStress(state, stressWorkers);
+    if (clipboardOwner) DestroyWindow(clipboardOwner);
     UnmapViewOfFile(state);
     return 0;
 }
@@ -863,6 +958,30 @@ private:
     HDESK originalDesktop_ = nullptr, desktop_ = nullptr;
 };
 
+struct FixtureClipboardOwner {
+    HWND window = CreateWindowExW(0, L"STATIC", L"Second synthetic clipboard writer", 0,
+        0, 0, 0, 0, HWND_MESSAGE, nullptr, GetModuleHandleW(nullptr), nullptr);
+    ~FixtureClipboardOwner() { if (window) DestroyWindow(window); }
+    bool Write(const wchar_t* text) {
+        if (!window || !OpenClipboard(window)) return false;
+        bool written = false;
+        if (EmptyClipboard()) {
+            const size_t size = (wcslen(text) + 1) * sizeof(wchar_t);
+            HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, size);
+            if (memory) {
+                void* data = GlobalLock(memory);
+                if (data) {
+                    memcpy(data, text, size);GlobalUnlock(memory);
+                    written = SetClipboardData(CF_UNICODETEXT, memory) != nullptr;
+                }
+                if (!written) GlobalFree(memory);
+            }
+        }
+        CloseClipboard();
+        return written;
+    }
+};
+
 int ControllerMain(const wchar_t* dllPath) {
     int result = 1;
     PrivateClipboardDesktop clipboardDesktop;
@@ -875,6 +994,7 @@ int ControllerMain(const wchar_t* dllPath) {
     std::wstring mutexName = L"Local\\ClipboardProtector.InjectionSmoke.Mutex." + suffix;
     std::wstring cryptoMapName =
         L"Local\\ClipboardProtector.InjectionSmoke.Crypto." + suffix;
+    std::wstring sourceMapName = L"Local\\ClipboardProtector.InjectionSmoke.Source." + suffix;
     std::wstring exePath = CurrentExecutablePath();
     if (exePath.empty()) return 2;
 
@@ -883,6 +1003,8 @@ int ControllerMain(const wchar_t* dllPath) {
     SetEnvironmentVariableW(L"CLIP_TEST_CONTROLLER_MUTEX", mutexName.c_str());
     SetEnvironmentVariableW(L"CLIP_TEST_SERVER_PATH", exePath.c_str());
     SetEnvironmentVariableW(L"CLIP_TEST_CRYPTO_MAP", cryptoMapName.c_str());
+    SetEnvironmentVariableW(L"CLIP_TEST_SOURCE_MAP", sourceMapName.c_str());
+    SetEnvironmentVariableW(L"CLIP_TEST_DLL_PATH", dllPath);
 
     HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, stopName.c_str());
     HANDLE controllerMutex = CreateMutexW(nullptr, TRUE, mutexName.c_str());
@@ -896,13 +1018,17 @@ int ControllerMain(const wchar_t* dllPath) {
     HANDLE readyEvent = CreateEventW(&security, TRUE, FALSE, nullptr);
     HANDLE commandEvent = CreateEventW(&security, FALSE, FALSE, nullptr);
     HANDLE doneEvent = CreateEventW(&security, FALSE, FALSE, nullptr);
+    HANDLE barrierEntered = CreateEventW(&security, TRUE, FALSE, nullptr);
+    HANDLE barrierResume = CreateEventW(&security, TRUE, FALSE, nullptr);
     HANDLE mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &security,
                                         PAGE_READWRITE, 0, sizeof(SharedState), nullptr);
     HANDLE cryptoMapping = CreateFileMappingW(
         INVALID_HANDLE_VALUE, &security, PAGE_READWRITE, 0,
         sizeof(clip::SharedCryptoProtection), cryptoMapName.c_str());
+    HANDLE sourceMapping = CreateFileMappingW(INVALID_HANDLE_VALUE, &security, PAGE_READWRITE,
+        0, sizeof(clip::SharedClipboardSource), sourceMapName.c_str());
     if (!readyEvent || !commandEvent || !doneEvent || !mapping ||
-        !cryptoMapping)
+        !cryptoMapping || !sourceMapping || !barrierEntered || !barrierResume)
         return 4;
     auto* state = static_cast<SharedState*>(
         MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(SharedState)));
@@ -914,6 +1040,13 @@ int ControllerMain(const wchar_t* dllPath) {
     if (!cryptoState) return 5;
     ZeroMemory(cryptoState, sizeof(*cryptoState));
     cryptoState->structureVersion = clip::kCryptoProtectionVersion;
+    state->locale = 0x0419;
+    state->barrierEntered = reinterpret_cast<ULONG_PTR>(barrierEntered);
+    state->barrierResume = reinterpret_cast<ULONG_PTR>(barrierResume);
+    auto* sourceState = static_cast<clip::SharedClipboardSource*>(MapViewOfFile(sourceMapping,
+        FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(clip::SharedClipboardSource)));
+    if (!sourceState) return 5;
+    ZeroMemory(sourceState, sizeof(*sourceState));
 
     std::wstring command = L"\"" + exePath + L"\" --target " +
                            std::to_wstring((ULONG_PTR)readyEvent) + L" " +
@@ -939,7 +1072,8 @@ int ControllerMain(const wchar_t* dllPath) {
                             std::memory_order_release);
             connectDone.store(true, std::memory_order_release);
         });
-        if (!PostThreadMessageW(process.dwThreadId, WM_APP + 77, 0, 0)) {
+        const UINT startMessage = RegisterWindowMessageW(clip::kTargetHookStartMessageName);
+        if (!startMessage || !PostThreadMessageW(process.dwThreadId, startMessage, 0, 0)) {
             CancelSynchronousIo((HANDLE)connector.native_handle());
         }
         ULONGLONG connectDeadline = GetTickCount64() + 8000;
@@ -1621,6 +1755,17 @@ int ControllerMain(const wchar_t* dllPath) {
             result = 40;
             break;
         }
+        // Same thread/format/source/sequence, two independent denied writes:
+        // each must have its own audit event even though nothing was modified.
+        CommandResult secondReplacement;
+        if (!RunTextCommand(commandEvent, doneEvent, state, kCommandSetText,
+                            replacementAddress, secondReplacement) ||
+            secondReplacement.error != ERROR_ACCESS_DENIED ||
+            !ReadEvent(pipe, event, 5000) || event.blocked != 1 ||
+            event.ruleName != L"Crypto 保护：地址替换") {
+            result = 120;
+            break;
+        }
         // These commands deliberately do not open the desktop clipboard: the
         // native API may fail, but Crypto must not turn them into access denial.
         const auto checkCryptoWrite = [&](const std::wstring& text, bool blocked,
@@ -1774,6 +1919,112 @@ int ControllerMain(const wchar_t* dllPath) {
         InterlockedExchange(&cryptoState->enabled, 0);
         InterlockedExchange(&cryptoState->active, 0);
 
+        // Hold the worker's sender after dequeueing a real confirmation. The
+        // caller and wire request must share the original absolute deadline.
+        if (!SendNotificationState(pipe, processName, clip::kRuleConfirm, false,
+                clip::kFormatText, L"deadline-confirm", 0, -1,
+                clip::kDefaultShortcutAuthorizationWindowMs, -1, false,
+                L"", 1000, true)) { result = 121; break; }
+        Sleep(150);
+        for (bool expireInQueue : {false, true}) {
+            ResetEvent(barrierEntered);ResetEvent(barrierResume);
+            CommandResult installed;
+            if (!RunCommand(commandEvent, doneEvent, state, kCommandConfirmationBarrier, 0, installed) ||
+                !installed.value) { result = 122; break; }
+            wcscpy_s(state->text, L"fixture confirmation deadline");state->format = CF_UNICODETEXT;
+            const ULONGLONG started = GetTickCount64();
+            MemoryBarrier();InterlockedExchange(&state->command, kCommandSetText);SetEvent(commandEvent);
+            if (WaitForSingleObject(barrierEntered, 2000) != WAIT_OBJECT_0) { result = 123; break; }
+            if (expireInQueue) {
+                if (WaitForSingleObject(doneEvent, 1800) != WAIT_OBJECT_0 ||
+                    state->error != ERROR_ACCESS_DENIED) { result = 124; break; }
+                SetEvent(barrierResume);
+                // The next frame is the denial audit; an expired request was
+                // never transmitted to a controller/window with a new clock.
+                if (!ReadEvent(pipe, event, 5000) || !event.blocked) { result = 125; break; }
+            } else {
+                Sleep(650);SetEvent(barrierResume);
+                ConfirmationFrame confirmation;
+                if (!ReadConfirmation(pipe, confirmation, 2000) ||
+                    confirmation.timeoutMs != 1000 || confirmation.deadline < started + 1000 ||
+                    confirmation.deadline > started + 1300 ||
+                    WaitForSingleObject(doneEvent, 2000) != WAIT_OBJECT_0 ||
+                    GetTickCount64() > confirmation.deadline + 300 ||
+                    state->error != ERROR_ACCESS_DENIED ||
+                    !ReadEvent(pipe, event, 5000) || !event.blocked) { result = 126; break; }
+            }
+        }
+        SetEvent(barrierResume);
+        if (result != 1) break;
+
+        if (!clipboardDesktop.path.empty()) {
+            if (!SendNotificationState(pipe, processName, clip::kRuleAllow, true,
+                    clip::kFormatAny, L"locale-allow", 0)) { result = 127; break; }
+            Sleep(150);
+            const auto consumeWrites = [&](UINT first, UINT second, bool secondBlocked,
+                                           const wchar_t* textPreview = nullptr) {
+                PipeEvent a, b;
+                return ReadEvent(pipe, a, 5000) && ReadEvent(pipe, b, 5000) &&
+                    a.op == clip::kOpWrite && b.op == clip::kOpWrite &&
+                    a.format == first && b.format == second && !a.blocked &&
+                    b.blocked == (secondBlocked ? 1 : 0) &&
+                    (!textPreview || (first == CF_TEXT ? a.preview : b.preview) == textPreview);
+            };
+            state->locale = 0x0419;state->codePage = 1251;
+            for (Command order : {kCommandLocaleFirst, kCommandLocaleLast}) {
+                CommandResult written, read;
+                if (!RunTextCommand(commandEvent, doneEvent, state, order, L"Привет", written, CF_TEXT) ||
+                    !written.value || !consumeWrites(order == kCommandLocaleFirst ? CF_LOCALE : CF_TEXT,
+                        order == kCommandLocaleFirst ? CF_TEXT : CF_LOCALE, false,
+                        order == kCommandLocaleFirst ? L"Привет" : nullptr) ||
+                    !RunCommand(commandEvent, doneEvent, state, kCommandReadText, CF_TEXT, read) ||
+                    !read.value || !ReadEvent(pipe, event, 5000) || event.preview != L"Привет" ||
+                    event.format != CF_TEXT || event.op != clip::kOpRead) { result = 128; break; }
+            }
+            if (result != 1) break;
+            // Choose a non-default code page so the first CF_TEXT is allowed,
+            // while its later explicit locale would reveal forbidden text.
+            const bool defaultRussian = state->defaultCodePage == 1251;
+            const wchar_t* forbidden = defaultRussian ? L"あいう" : L"Привет";
+            state->locale = defaultRussian ? 0x0411 : 0x0419;
+            state->codePage = defaultRussian ? 932 : 1251;
+            if (!SendNotificationState(pipe, processName, clip::kRuleBlock, true,
+                    clip::kFormatText, L"locale-sensitive", 0, -1,
+                    clip::kDefaultShortcutAuthorizationWindowMs, -1, false,
+                    std::wstring(L"^") + forbidden + L"$")) { result = 129; break; }
+            Sleep(150);
+            for (Command order : {kCommandLocaleFirst, kCommandLocaleLast}) {
+                CommandResult blocked;
+                if (!RunTextCommand(commandEvent, doneEvent, state, order, forbidden, blocked, CF_TEXT) ||
+                    blocked.value || blocked.error != ERROR_ACCESS_DENIED ||
+                    !consumeWrites(order == kCommandLocaleFirst ? CF_LOCALE : CF_TEXT,
+                        order == kCommandLocaleFirst ? CF_TEXT : CF_LOCALE, true)) { result = 130; break; }
+            }
+            if (result != 1) break;
+            if (!SendNotificationState(pipe, processName, clip::kRuleAllow, true,
+                    clip::kFormatAny, L"source-fixture", 0)) { result = 131; break; }
+            Sleep(150);state->codePage = 0;
+            FixtureClipboardOwner secondWriter;
+            ResetEvent(barrierEntered);ResetEvent(barrierResume);
+            CommandResult installed;
+            if (!RunCommand(commandEvent, doneEvent, state, kCommandCloseBarrier, 0, installed) ||
+                !installed.value) { result = 132; break; }
+            wcscpy_s(state->text, L"writer A");state->format = CF_UNICODETEXT;
+            MemoryBarrier();InterlockedExchange(&state->command, kCommandCopyText);SetEvent(commandEvent);
+            if (WaitForSingleObject(barrierEntered, 3000) != WAIT_OBJECT_0 ||
+                !secondWriter.Write(L"writer B")) { result = 133; break; }
+            const DWORD writerBSequence = GetClipboardSequenceNumber();
+            SetEvent(barrierResume);
+            CommandResult read;
+            if (WaitForSingleObject(doneEvent, 3000) != WAIT_OBJECT_0 ||
+                sourceState->sequence == writerBSequence ||
+                !ReadEvent(pipe, event, 5000) || event.op != clip::kOpWrite ||
+                !RunCommand(commandEvent, doneEvent, state, kCommandReadText, CF_UNICODETEXT, read) ||
+                !read.value || wcscmp(state->text, L"writer B") ||
+                !ReadEvent(pipe, event, 5000) || event.sourcePid != GetCurrentProcessId() ||
+                event.sequence != writerBSequence) { result = 134; break; }
+        }
+
         // Hold off pipe reads while the target produces more events than the
         // bounded queue can retain, then require an explicit non-zero gap.
         if (!SendExtendedState(pipe, false)) {
@@ -1839,19 +2090,40 @@ int ControllerMain(const wchar_t* dllPath) {
                    InterlockedCompareExchange(&state->stressWorkers, 0, 0) == 0;
         };
         auto restartWorker = [&]() -> bool {
-            if (!waitPipeClosed()) return false;
+            if (!waitPipeClosed()) {
+                std::fprintf(stderr, "restart-stage=wait-pipe-closed error=%lu\n", GetLastError());
+                return false;
+            }
+            CommandResult stopped;
+            if (!RunCommand(commandEvent, doneEvent, state, kCommandWaitWorkerStopped,
+                            0, stopped, 8000) || stopped.error != ERROR_SUCCESS) {
+                std::fprintf(stderr, "restart-stage=worker-rundown lifecycle=%llu error=%lu\n",
+                    static_cast<unsigned long long>(stopped.value), stopped.error);
+                return false;
+            }
             disconnectTarget();
             ResetEvent(stopEvent);
-            Sleep(50);
-            if (!connectTarget() ||
-                !SendState(pipe, L"", clip::kAllowRecord, true))
+            if (!connectTarget()) {
+                std::fprintf(stderr, "restart-stage=connect error=%lu\n", GetLastError());
                 return false;
+            }
+            if (!SendState(pipe, L"", clip::kAllowRecord, true)) {
+                std::fprintf(stderr, "restart-stage=send-state error=%lu\n", GetLastError());
+                return false;
+            }
             Sleep(100);
             CommandResult stressStart;
             if (!RunCommand(commandEvent, doneEvent, state, kCommandStressStart,
-                            CF_UNICODETEXT, stressStart) || stressStart.value != 1)
+                            CF_UNICODETEXT, stressStart) || stressStart.value != 1) {
+                std::fprintf(stderr, "restart-stage=start-stress value=%llu error=%lu\n",
+                    static_cast<unsigned long long>(stressStart.value), stressStart.error);
                 return false;
-            return WaitForStressReady(state);
+            }
+            const bool ready = WaitForStressReady(state);
+            if (!ready) std::fprintf(stderr, "restart-stage=stress-ready calls=%ld failures=%ld\n",
+                InterlockedCompareExchange(&state->stressCalls, 0, 0),
+                InterlockedCompareExchange(&state->stressThreadFailures, 0, 0));
+            return ready;
         };
 
         // Repeated stop-event cycles force the injected worker to detach and
@@ -1901,6 +2173,7 @@ int ControllerMain(const wchar_t* dllPath) {
     } while (false);
 
     SetEvent(stopEvent);
+    SetEvent(barrierResume);
     if (hook && !UnhookWindowsHookEx(hook) && result == 0) result = 25;
     CommandResult ignored;
     RunCommand(commandEvent, doneEvent, state, kCommandExit, 0, ignored, 1000);
@@ -1918,10 +2191,14 @@ int ControllerMain(const wchar_t* dllPath) {
     DisconnectNamedPipe(pipe);
     UnmapViewOfFile(state);
     UnmapViewOfFile(cryptoState);
+    UnmapViewOfFile(sourceState);
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     CloseHandle(mapping);
     CloseHandle(cryptoMapping);
+    CloseHandle(sourceMapping);
+    CloseHandle(barrierEntered);
+    CloseHandle(barrierResume);
     CloseHandle(doneEvent);
     CloseHandle(commandEvent);
     CloseHandle(readyEvent);

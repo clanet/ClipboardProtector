@@ -38,10 +38,10 @@ jobs:
       - name: Build
         run: cmake --build build/ci/${{ matrix.arch }} --config Release --parallel
       - name: Core smoke tests
-        run: ctest --test-dir build/ci/${{ matrix.arch }} -C Release -R '^(common_smoke|shutdown_detached_smoke|shutdown_retained_smoke|shutdown_disconnected_smoke|remote_unload_smoke|shutdown_trace_smoke|hook_smoke|hook_abort_smoke|detour_heap_smoke|hook_owner_smoke|hook_thread_smoke|injection_smoke|language_smoke|crypto_monitor_smoke)$' --output-on-failure
+        run: ctest --test-dir build/ci/${{ matrix.arch }} -C Release -R '^(common_smoke|shutdown_detached_smoke|shutdown_retained_smoke|shutdown_disconnected_smoke|remote_unload_smoke|remote_lifecycle_smoke|coverage_lifecycle_smoke|pipe_server_smoke|shutdown_trace_smoke|hook_smoke|hook_abort_smoke|detour_heap_smoke|hook_owner_smoke|hook_thread_smoke|injection_smoke|language_smoke|crypto_monitor_smoke)$' --output-on-failure
       - name: Extended desktop tests (opt-in)
         if: github.event_name == 'workflow_dispatch' && inputs.extended_tests
-        run: ctest --test-dir build/ci/${{ matrix.arch }} -C Release -E '^(common_smoke|shutdown_detached_smoke|shutdown_retained_smoke|shutdown_disconnected_smoke|remote_unload_smoke|shutdown_trace_smoke|hook_smoke|hook_abort_smoke|detour_heap_smoke|hook_owner_smoke|hook_thread_smoke|injection_smoke|language_smoke|crypto_monitor_smoke)$' --output-on-failure
+        run: ctest --test-dir build/ci/${{ matrix.arch }} -C Release -E '^(common_smoke|shutdown_detached_smoke|shutdown_retained_smoke|shutdown_disconnected_smoke|remote_unload_smoke|remote_lifecycle_smoke|coverage_lifecycle_smoke|pipe_server_smoke|shutdown_trace_smoke|hook_smoke|hook_abort_smoke|detour_heap_smoke|hook_owner_smoke|hook_thread_smoke|injection_smoke|language_smoke|crypto_monitor_smoke)$' --output-on-failure
       - name: Preserve test logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

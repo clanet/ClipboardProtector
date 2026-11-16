@@ -113,7 +113,7 @@ STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMEN
 CAPTION "剪贴板访问规则"
 FONT 9, "Segoe UI", 400, 0, 0x0
 BEGIN
-    LTEXT           "规则按列表顺序匹配，第一条命中后停止。可将可信例外放在阻止规则上方。",
+    LTEXT           "规则先按优先级从低到高匹配（0 最高），同优先级按列表顺序；首条命中后停止。可将可信例外设为更高优先级。",
                     IDC_LABEL_617, 8, 7, 470, 11
     CONTROL         "", IDC_LIST_RULES, "SysListView32",
                     LVS_REPORT | LVS_SHOWSELALWAYS | WS_CHILD | WS_VISIBLE |
@@ -137,8 +137,11 @@ FONT 9, "Segoe UI", 400, 0, 0x0
 BEGIN
     CONTROL         "启用这条规则", IDC_CHK_RULE_ENABLED, "Button",
                     BS_AUTOCHECKBOX | WS_TABSTOP, 12, 10, 72, 12
-    LTEXT           "规则名称：", IDC_LABEL_619, 100, 11, 46, 10
-    EDITTEXT        IDC_ED_RULE_NAME, 148, 8, 270, 14,
+    LTEXT           "优先级：", IDC_LABEL_642, 88, 11, 36, 10
+    COMBOBOX        IDC_CMB_PRIORITY, 126, 8, 48, 120,
+                    CBS_DROPDOWNLIST | WS_TABSTOP
+    LTEXT           "规则名称：", IDC_LABEL_619, 182, 11, 46, 10
+    EDITTEXT        IDC_ED_RULE_NAME, 230, 8, 188, 14,
                     ES_AUTOHSCROLL | WS_TABSTOP
 
     GROUPBOX        "本次访问进程", IDC_LABEL_620, 8, 29, 414, 55

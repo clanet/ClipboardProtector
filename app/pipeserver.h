@@ -28,6 +28,7 @@ struct AccessConfirmationRequest {
     std::wstring preview;
     PreviewKind previewKind = PreviewKind::Text;
     DWORD timeoutMs = 15000;
+    ULONGLONG deadline = 0;
     bool timeoutBlock = true;
 };
 
@@ -58,16 +59,34 @@ public:
     bool QueuePrivateClipboard(DWORD processId, const std::wstring& mappingName);
     std::vector<ReadyProcessIdentity> ReadyProcessIdentities();
 
+#ifdef CLIP_TEST_PIPE_SERVER
+    friend struct PipeServerTestAccess;
+#endif
 private:
     struct ConfirmationResponse {
         unsigned long long token = 0;
         bool allow = false;
     };
 
+    struct OutboundFrame {
+        std::string data;
+        unsigned long long deliveredVersion = 0;
+    };
+
     struct ClientCtx {
         PipeServer* self = nullptr;
-        HANDLE pipe = INVALID_HANDLE_VALUE;
+        std::atomic<HANDLE> pipe{INVALID_HANDLE_VALUE};
+        std::mutex pipeMu;
         HANDLE thread = nullptr;
+        HANDLE writerThread = nullptr;
+        HANDLE writerWake = nullptr;
+        HANDLE writerStop = nullptr;
+        std::mutex outboundMu;
+        std::deque<OutboundFrame> outbound;
+        size_t outboundBytes = 0;
+        std::atomic<bool> writerFinished{false};
+        std::atomic<bool> writeFailed{false};
+        std::atomic<unsigned long long> queuedStateVersion{0};
         std::atomic<bool> finished{false};
         DWORD pid = 0;
         ULONGLONG creationTime = 0;
@@ -82,6 +101,7 @@ private:
         std::atomic<bool> stateReady{false};
         std::atomic<bool> privateClipboardCapable{false};
         std::atomic<bool> textMetadataCapable{false};
+        std::atomic<bool> confirmationDeadlineCapable{false};
         std::atomic<bool> extendedCapable{false};
         std::atomic<bool> notificationCapable{false};
         std::atomic<bool> formatModelCapable{false};
@@ -97,10 +117,19 @@ private:
 
     static DWORD WINAPI ListenThreadStatic(LPVOID self);
     static DWORD WINAPI ClientThreadStatic(LPVOID param);
+    static DWORD WINAPI WriterThreadStatic(LPVOID param);
     DWORD ListenThreadNoThrow() noexcept;
     DWORD ClientThreadNoThrow(ClientCtx* ctx) noexcept;
+    DWORD WriterThreadNoThrow(ClientCtx* ctx) noexcept;
     DWORD ListenThread();
     DWORD ClientThread(ClientCtx* ctx);
+    DWORD WriterThread(ClientCtx* ctx);
+    bool QueueOutbound(ClientCtx* ctx, std::string data,
+                       unsigned long long deliveredVersion = 0);
+    void SignalWriterStop(ClientCtx* ctx) noexcept;
+    void CloseClientPipe(ClientCtx* ctx) noexcept;
+    bool JoinClient(ClientCtx* ctx, ULONGLONG deadline) noexcept;
+    void DeleteClient(ClientCtx* ctx) noexcept;
 
     HANDLE CreatePipe(bool firstInstance);
     bool EnsureSourceMapping();
@@ -154,10 +183,24 @@ private:
     std::atomic<bool> modernFormatsEnabled_{false};
     std::atomic<bool> logVisibilityRequired_{false};
 
+    std::mutex acceptMu_;
     std::mutex clientsMu_;
     std::vector<ClientCtx*> clients_;
+    struct BlockedLogState {
+        ULONGLONG tick = 0;
+        ClipOp op = kOpRead;
+        UINT format = 0;
+        DWORD sourcePid = 0;
+        DWORD clipboardSequence = 0;
+        unsigned long long hash = 0;
+        BYTE action = 0;
+        std::wstring ruleName;
+        BuiltinRule builtinRule = BuiltinRule::None;
+        PreviewKind previewKind = PreviewKind::Text;
+    };
     std::mutex eventsMu_;
     std::deque<LogRow> events_;
+    std::unordered_map<DWORD, BlockedLogState> blockedLogState_;
     size_t eventsSnapshotBytes_ = 0;
     unsigned long long serverDroppedEvents_ = 0;
     std::mutex inboundRateMu_;
@@ -167,6 +210,8 @@ private:
     struct ConfirmationTarget {
         unsigned long long connectionId = 0;
         unsigned long long token = 0;
+        ULONGLONG deadline = 0;
+        bool timeoutBlock = true;
     };
     std::mutex confirmationsMu_;
     std::deque<AccessConfirmationRequest> confirmations_;

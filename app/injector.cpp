@@ -257,8 +257,12 @@ bool Injector::InstallForThreadImpl(const std::wstring& hookDllPath,
     lastError_ = hook_.Install(proc, mod_, threadId);
     if (lastError_ != ERROR_SUCCESS) {
         lastErrorText_ = UiText(TextId::SetWindowsHookExWFailed);
-        FreeLibrary(mod_);
-        mod_ = nullptr;
+        // WAIT_TIMEOUT means the hook owner thread did not exit; it may still
+        // install the hook, so keep the module reference until Remove retries.
+        if (lastError_ != WAIT_TIMEOUT) {
+            FreeLibrary(mod_);
+            mod_ = nullptr;
+        }
         return false;
     }
     // This registered message both wakes an idle queue and explicitly starts

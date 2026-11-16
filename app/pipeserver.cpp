@@ -14,8 +14,13 @@ namespace clip {
 namespace {
 
 constexpr size_t kQueuedSnapshotBytesCapacity = 16u << 20;
+constexpr size_t kMaxOutboundBytes = 4u << 20;
+constexpr size_t kMaxOutboundFrames = 256;
 constexpr size_t kClientInboundBytesPerSecond = 8u << 20;
 constexpr size_t kGlobalInboundBytesPerSecond = 64u << 20;
+// A blocked process often retries the same clipboard call in a tight loop.
+// Collapse visible blocked rows to one per process per short window.
+constexpr ULONGLONG kBlockedLogDedupMs = 1000;
 
 static std::string ExtendedRulesMessage(const std::vector<Rule>& rules,
                                         unsigned modelVersion) {
@@ -310,8 +315,16 @@ static bool ParseEvent(const char* data, size_t size, size_t& consumed,
 PipeServer::~PipeServer() {
     Stop();
     if (listenThread_) {
-        CancelSynchronousIo(listenThread_);
-        WaitForSingleObject(listenThread_, INFINITE);
+        const std::wstring pipeName =
+            ResolveObjectName(L"CLIP_TEST_PIPE_NAME", kPipeName);
+        while (WaitForSingleObject(listenThread_, 0) != WAIT_OBJECT_0) {
+            CancelSynchronousIo(listenThread_);
+            HANDLE wake = CreateFileW(pipeName.c_str(),
+                                      GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                      OPEN_EXISTING, 0, nullptr);
+            if (wake != INVALID_HANDLE_VALUE) CloseHandle(wake);
+            WaitForSingleObject(listenThread_, 10);
+        }
         CloseHandle(listenThread_);
         listenThread_ = nullptr;
     }
@@ -440,7 +453,12 @@ void PipeServer::PublishCryptoSetting(bool enabled, bool resetState) noexcept {
 
 
 bool PipeServer::Start(HWND notifyWnd, bool targetedMode, DWORD targetedPid) {
-    if (listenThread_) return false;
+    if (listenThread_) {
+        if (WaitForSingleObject(listenThread_, 0) != WAIT_OBJECT_0)
+            return false;
+        CloseHandle(listenThread_);
+        listenThread_ = nullptr;
+    }
     const bool sourceWasReady = sourceMapping_ && source_;
     const bool cryptoWasReady = cryptoMapping_ && crypto_;
     const bool stopEventWasReady = stopEvent_ != nullptr;
@@ -524,14 +542,22 @@ bool PipeServer::Start(HWND notifyWnd, bool targetedMode, DWORD targetedPid) {
         rollbackStart(ERROR_NOT_ENOUGH_MEMORY);
         return false;
     }
-    std::string initialRules = ExtendedRulesMessage(g_app.cfg.rules, 4);
-    std::string initialRulesV3 = ExtendedRulesMessage(g_app.cfg.rules, 3);
-    std::string initialRulesV2 = ExtendedRulesMessage(g_app.cfg.rules, 2);
-    std::string initialLegacyRules = LegacyRulesMessage(g_app.cfg.rules);
+    std::vector<Rule> initialRuleOrder;
+    try {
+        initialRuleOrder = g_app.cfg.rules;
+        SortRulesByPriority(initialRuleOrder);
+    } catch (...) {
+        rollbackStart(ERROR_NOT_ENOUGH_MEMORY);
+        return false;
+    }
+    std::string initialRules = ExtendedRulesMessage(initialRuleOrder, 4);
+    std::string initialRulesV3 = ExtendedRulesMessage(initialRuleOrder, 3);
+    std::string initialRulesV2 = ExtendedRulesMessage(initialRuleOrder, 2);
+    std::string initialLegacyRules = LegacyRulesMessage(initialRuleOrder);
     std::unordered_map<std::wstring, BYTE> initialNotificationRules;
     bool notificationRulesReady = true;
     try {
-        initialNotificationRules = NotificationRuleMap(g_app.cfg.rules);
+        initialNotificationRules = NotificationRuleMap(initialRuleOrder);
     } catch (...) {
         notificationRulesReady = false;
     }
@@ -561,10 +587,10 @@ bool PipeServer::Start(HWND notifyWnd, bool targetedMode, DWORD targetedPid) {
 
         notificationActionsByRule_ = std::move(initialNotificationRules);
         modernFormatsEnabled_.store(
-            HasModernFormatRule(g_app.cfg.rules), std::memory_order_release);
+            HasModernFormatRule(initialRuleOrder), std::memory_order_release);
         logVisibilityRequired_.store(
             g_app.cfg.settings.ignoreCustomFormats ||
-                HasHiddenLogRule(g_app.cfg.rules),
+                HasHiddenLogRule(initialRuleOrder),
             std::memory_order_release);
         stateVersion_ = 1;
     }
@@ -608,7 +634,7 @@ void PipeServer::Stop() {
     trace.Open(L"pipe-server");
     trace.Mark("server.stop.begin");
     PublishCryptoSetting(false, true);
-    if (!listenThread_) return;
+    const bool hasListener = listenThread_ != nullptr;
     // Prevent late worker notifications from targeting a window that is being
     // torn down. The pipe threads only use this atomic snapshot for PostMessage.
     const HWND notifyWnd = wnd_.exchange(nullptr, std::memory_order_acq_rel);
@@ -650,17 +676,19 @@ void PipeServer::Stop() {
     stop_.store(true, std::memory_order_release);
     trace.Mark("server.shutdown_published");
 
-    HANDLE initial = INVALID_HANDLE_VALUE;
-    {
-        std::lock_guard<std::mutex> lock(listenMu_);
-        initial = initialPipe_;
-    }
-    if (initial != INVALID_HANDLE_VALUE) CancelIoEx(initial, nullptr);
     const std::wstring pipeName =
         ResolveObjectName(L"CLIP_TEST_PIPE_NAME", kPipeName);
-    HANDLE wake = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE, 0,
-                              nullptr, OPEN_EXISTING, 0, nullptr);
-    if (wake != INVALID_HANDLE_VALUE) CloseHandle(wake);
+    if (hasListener) {
+        HANDLE initial = INVALID_HANDLE_VALUE;
+        {
+            std::lock_guard<std::mutex> lock(listenMu_);
+            initial = initialPipe_;
+        }
+        if (initial != INVALID_HANDLE_VALUE) CancelIoEx(initial, nullptr);
+        HANDLE wake = CreateFileW(pipeName.c_str(), GENERIC_READ | GENERIC_WRITE,
+                                  0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (wake != INVALID_HANDLE_VALUE) CloseHandle(wake);
+    }
     trace.Mark("server.listener_woken");
 
     // Give each worker time to remove Detours and acknowledge shutdown. A
@@ -687,6 +715,17 @@ void PipeServer::Stop() {
             trace.Mark("server.shutdown_acks.end", delivered, delivered ? ERROR_SUCCESS : WAIT_TIMEOUT);
             break;
         }
+        // Retry the wake connect: the first one can race the listener between
+        // publishing initialPipe_ and entering ConnectNamedPipe. A client that
+        // connects here is accepted and immediately discarded because stop_ is
+        // already set, which lets the listener leave ConnectNamedPipe.
+        if (hasListener &&
+            WaitForSingleObject(listenThread_, 0) == WAIT_TIMEOUT) {
+            HANDLE wake = CreateFileW(pipeName.c_str(),
+                                      GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                      OPEN_EXISTING, 0, nullptr);
+            if (wake != INVALID_HANDLE_VALUE) CloseHandle(wake);
+        }
         Sleep(10);
     }
     {
@@ -698,27 +737,41 @@ void PipeServer::Stop() {
             trace.Mark(outcome, ctx->pid);
         }
     }
-    HANDLE listener = listenThread_;
-    trace.Mark("server.listener_wait.begin");
-    DWORD listenerResult = WaitForSingleObject(listener, 5000);
-    trace.Mark("server.listener_wait.end", listenerResult);
-    if (listenerResult != WAIT_OBJECT_0) {
-        trace.Mark("server.listener_cancel.begin");
-        CancelSynchronousIo(listener);
-        // Keep the handle and object ownership if cancellation is slow. The
-        // UI stop remains bounded; the destructor performs the final wait.
-        listenerResult = WaitForSingleObject(listener, 2000);
-        trace.Mark("server.listener_cancel.end", listenerResult);
+    if (hasListener) {
+        HANDLE listener = listenThread_;
+        trace.Mark("server.listener_wait.begin");
+        DWORD listenerResult = WAIT_TIMEOUT;
+        const ULONGLONG listenerDeadline = GetTickCount64() + 5000;
+        while (GetTickCount64() < listenerDeadline) {
+            listenerResult = WaitForSingleObject(listener, 0);
+            if (listenerResult == WAIT_OBJECT_0) break;
+            HANDLE wake = CreateFileW(pipeName.c_str(),
+                                      GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                      OPEN_EXISTING, 0, nullptr);
+            if (wake != INVALID_HANDLE_VALUE) CloseHandle(wake);
+            Sleep(10);
+        }
+        trace.Mark("server.listener_wait.end", listenerResult);
+        if (listenerResult != WAIT_OBJECT_0) {
+            trace.Mark("server.listener_cancel.begin");
+            CancelSynchronousIo(listener);
+            // Keep the handle and object ownership if cancellation is slow.
+            // The UI stop remains bounded; the destructor performs the final
+            // wait.
+            listenerResult = WaitForSingleObject(listener, 2000);
+            trace.Mark("server.listener_cancel.end", listenerResult);
+        }
+        if (listenerResult == WAIT_OBJECT_0) CloseHandle(listener);
+        if (listenerResult == WAIT_OBJECT_0) listenThread_ = nullptr;
     }
-    if (listenerResult == WAIT_OBJECT_0) CloseHandle(listener);
-    if (listenerResult == WAIT_OBJECT_0) listenThread_ = nullptr;
-    SetEvent(stopEvent_);
+    if (stopEvent_) SetEvent(stopEvent_);
     trace.Mark("server.clients_stop.begin");
     StopClients(false);
     trace.Mark("server.clients_stop.end");
     {
         std::lock_guard<std::mutex> lock(eventsMu_);
         events_.clear();
+        blockedLogState_.clear();
         eventsSnapshotBytes_ = 0;
         serverDroppedEvents_ = 0;
     }
@@ -726,13 +779,20 @@ void PipeServer::Stop() {
 }
 
 void PipeServer::BroadcastRules(const std::vector<Rule>& rules) {
-    std::string message = ExtendedRulesMessage(rules, 4);
-    std::string messageV3 = ExtendedRulesMessage(rules, 3);
-    std::string messageV2 = ExtendedRulesMessage(rules, 2);
-    std::string legacyMessage = LegacyRulesMessage(rules);
+    std::vector<Rule> ordered;
+    try {
+        ordered = rules;
+        SortRulesByPriority(ordered);
+    } catch (...) {
+        return;
+    }
+    std::string message = ExtendedRulesMessage(ordered, 4);
+    std::string messageV3 = ExtendedRulesMessage(ordered, 3);
+    std::string messageV2 = ExtendedRulesMessage(ordered, 2);
+    std::string legacyMessage = LegacyRulesMessage(ordered);
     std::unordered_map<std::wstring, BYTE> notificationRules;
     try {
-        notificationRules = NotificationRuleMap(rules);
+        notificationRules = NotificationRuleMap(ordered);
     } catch (...) {
         return;
     }
@@ -745,10 +805,10 @@ void PipeServer::BroadcastRules(const std::vector<Rule>& rules) {
     rulesV2Msg_ = std::move(messageV2);
     legacyRulesMsg_ = std::move(legacyMessage);
     notificationActionsByRule_ = std::move(notificationRules);
-    modernFormatsEnabled_.store(HasModernFormatRule(rules),
+    modernFormatsEnabled_.store(HasModernFormatRule(ordered),
                                 std::memory_order_release);
     logVisibilityRequired_.store(
-        g_app.cfg.settings.ignoreCustomFormats || HasHiddenLogRule(rules),
+        g_app.cfg.settings.ignoreCustomFormats || HasHiddenLogRule(ordered),
         std::memory_order_release);
     ++stateVersion_;
 }
@@ -801,11 +861,16 @@ bool PipeServer::PopEvent(LogRow& event) {
 }
 
 bool PipeServer::PopConfirmation(AccessConfirmationRequest& request) {
-    std::lock_guard<std::mutex> lock(confirmationsMu_);
-    if (confirmations_.empty()) return false;
-    request = std::move(confirmations_.front());
-    confirmations_.pop_front();
-    return true;
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lock(confirmationsMu_);
+            if (confirmations_.empty()) return false;
+            request = std::move(confirmations_.front());
+            confirmations_.pop_front();
+        }
+        if (GetTickCount64() < request.deadline) return true;
+        ResolveConfirmation(request.id, !request.timeoutBlock);
+    }
 }
 
 bool PipeServer::PopCancelledConfirmation(DWORD& requestId) {
@@ -853,6 +918,8 @@ bool PipeServer::QueueConfirmation(ClientCtx* ctx,
                                    AccessConfirmationRequest request,
                                    unsigned long long token) {
     if (!ctx) return false;
+    if (GetTickCount64() >= request.deadline)
+        return QueueConfirmationResponse(ctx, token, !request.timeoutBlock);
     const DWORD next = nextConfirmationId_.fetch_add(1,
                                                       std::memory_order_relaxed);
     request.id = next ? next : nextConfirmationId_.fetch_add(
@@ -869,10 +936,13 @@ bool PipeServer::QueueConfirmation(ClientCtx* ctx,
 
     try {
         std::lock_guard<std::mutex> lock(confirmationsMu_);
+        if (GetTickCount64() >= request.deadline)
+            return QueueConfirmationResponse(ctx, token, !request.timeoutBlock);
         if (confirmationTargets_.size() >= 256 || confirmations_.size() >= 256)
             return false;
         const auto inserted = confirmationTargets_.emplace(
-            requestId, ConfirmationTarget{ctx->connectionId, token});
+            requestId, ConfirmationTarget{ctx->connectionId, token,
+                                          request.deadline, request.timeoutBlock});
         if (!inserted.second) return false;
         try {
             confirmations_.push_back(std::move(request));
@@ -908,6 +978,7 @@ bool PipeServer::ResolveConfirmation(DWORD requestId, bool allow) {
         target = found->second;
         confirmationTargets_.erase(found);
     }
+    if (GetTickCount64() >= target.deadline) allow = !target.timeoutBlock;
 
     std::lock_guard<std::mutex> clientsLock(clientsMu_);
     for (ClientCtx* ctx : clients_) {
@@ -956,8 +1027,41 @@ void PipeServer::CancelClientConfirmations(
 }
 
 bool PipeServer::QueueLogRow(LogRow row) noexcept {
+    const DWORD blockedPid = row.pid;
+    const bool dedupeBlocked =
+        row.blocked && row.action == kRuleBlock && !row.gap &&
+        !row.hideFromLogList && blockedPid != 0 && row.hash != 0 &&
+        row.missingEvents == 0;
     try {
         std::lock_guard<std::mutex> lock(eventsMu_);
+        const ULONGLONG now = GetTickCount64();
+        BlockedLogState candidate;
+        if (dedupeBlocked) {
+            candidate.op = static_cast<ClipOp>(row.op);
+            candidate.format = row.fmt;
+            candidate.sourcePid = row.sourcePid;
+            candidate.clipboardSequence = row.clipboardSequence;
+            candidate.hash = row.hash;
+            candidate.action = row.action;
+            candidate.ruleName = row.ruleName;
+            candidate.builtinRule = row.builtinRule;
+            candidate.previewKind = row.previewKind;
+            const auto found = blockedLogState_.find(blockedPid);
+            if (found != blockedLogState_.end() &&
+                now >= found->second.tick &&
+                now - found->second.tick < kBlockedLogDedupMs &&
+                found->second.op == candidate.op &&
+                found->second.format == candidate.format &&
+                found->second.sourcePid == candidate.sourcePid &&
+                found->second.clipboardSequence ==
+                    candidate.clipboardSequence &&
+                found->second.hash == candidate.hash &&
+                found->second.action == candidate.action &&
+                found->second.ruleName == candidate.ruleName &&
+                found->second.builtinRule == candidate.builtinRule &&
+                found->second.previewKind == candidate.previewKind)
+                return false;
+        }
         if (events_.size() >= 8192) {
             const bool important = row.gap || row.blocked ||
                                    row.showNotification ||
@@ -994,6 +1098,24 @@ bool PipeServer::QueueLogRow(LogRow row) noexcept {
         const size_t snapshotBytes = row.snapshot.size();
         events_.push_back(std::move(row));
         eventsSnapshotBytes_ += snapshotBytes;
+        if (dedupeBlocked) {
+            try {
+                if (blockedLogState_.size() >= 1024) {
+                    for (auto it = blockedLogState_.begin();
+                         it != blockedLogState_.end();) {
+                        if (now >= it->second.tick &&
+                            now - it->second.tick >= kBlockedLogDedupMs)
+                            it = blockedLogState_.erase(it);
+                        else
+                            ++it;
+                    }
+                }
+                candidate.tick = now;
+                blockedLogState_[blockedPid] = std::move(candidate);
+            } catch (...) {
+                // The row is already queued; deduplication is best effort.
+            }
+        }
         return true;
     } catch (...) {
         std::lock_guard<std::mutex> lock(eventsMu_);
@@ -1156,7 +1278,6 @@ DWORD PipeServer::ListenThread() {
         {
             std::lock_guard<std::mutex> lock(clientsMu_);
             if (clients_.size() >= 512) {
-                DisconnectNamedPipe(pipe);
                 CloseHandle(pipe);
                 pipe = INVALID_HANDLE_VALUE;
                 continue;
@@ -1169,7 +1290,6 @@ DWORD PipeServer::ListenThread() {
             continue;
         }
         if ((targetedMode_ && (targetedPid_ == 0 || pid != targetedPid_))) {
-            DisconnectNamedPipe(pipe);
             CloseHandle(pipe);
             pipe = INVALID_HANDLE_VALUE;
             continue;
@@ -1179,10 +1299,18 @@ DWORD PipeServer::ListenThread() {
         if (!ProcessIdToSessionId(GetCurrentProcessId(), &serverSession) ||
             !GetNamedPipeClientSessionId(pipe, &clientSession) ||
             serverSession != clientSession) {
-            DisconnectNamedPipe(pipe);
             CloseHandle(pipe);
             pipe = INVALID_HANDLE_VALUE;
             continue;
+        }
+        // Shutdown can begin while the client identity is being checked.
+        // Re-check before publishing the connection so StopClients cannot
+        // miss a worker created after it swapped the client list.
+        if (stop_.load(std::memory_order_acquire) ||
+            !accepting_.load(std::memory_order_acquire)) {
+            CloseHandle(pipe);
+            pipe = INVALID_HANDLE_VALUE;
+            break;
         }
         auto* ctx = new (std::nothrow) ClientCtx;
         if (!ctx) {
@@ -1191,7 +1319,7 @@ DWORD PipeServer::ListenThread() {
             continue;
         }
         ctx->self = this;
-        ctx->pipe = pipe;
+        ctx->pipe.store(pipe, std::memory_order_release);
         ctx->pid = pid;
         ctx->connectionId = nextConnectionId_.fetch_add(
             1, std::memory_order_relaxed);
@@ -1206,15 +1334,48 @@ DWORD PipeServer::ListenThread() {
             CloseHandle(process);
         }
 
+        ctx->writerWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        ctx->writerStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ctx->writerWake || !ctx->writerStop) {
+            if (ctx->writerWake) CloseHandle(ctx->writerWake);
+            if (ctx->writerStop) CloseHandle(ctx->writerStop);
+            CloseHandle(ctx->pipe.load(std::memory_order_acquire));
+            delete ctx;
+            pipe = INVALID_HANDLE_VALUE;
+            continue;
+        }
+        ctx->writerThread = CreateThread(nullptr, 0, WriterThreadStatic, ctx,
+                                         0, nullptr);
+        if (!ctx->writerThread) {
+            CloseHandle(ctx->writerWake);
+            CloseHandle(ctx->writerStop);
+            CloseHandle(ctx->pipe.load(std::memory_order_acquire));
+            delete ctx;
+            pipe = INVALID_HANDLE_VALUE;
+            continue;
+        }
         ctx->thread = CreateThread(nullptr, 0, ClientThreadStatic, ctx, 0, nullptr);
         if (!ctx->thread) {
-            CloseHandle(ctx->pipe);
-            delete ctx;
+            JoinClient(ctx, 0);
+            DeleteClient(ctx);
         } else {
-            {
-                std::lock_guard<std::mutex> lock(clientsMu_);
-                clients_.push_back(ctx);
-                PostClientCountLocked();
+            // Serialize publication against StopClients. Stop sets accepting_
+            // false before calling StopClients; this lock guarantees a client
+            // cannot be added after StopClients has swapped the list.
+            std::unique_lock<std::mutex> acceptLock(acceptMu_);
+            if (stop_.load(std::memory_order_acquire) ||
+                !accepting_.load(std::memory_order_acquire)) {
+                // The listener retains ownership until both workers exit.
+                // The destructor joins this listener before destroying self.
+                acceptLock.unlock();
+                JoinClient(ctx, 0);
+                DeleteClient(ctx);
+            } else {
+                {
+                    std::lock_guard<std::mutex> lock(clientsMu_);
+                    clients_.push_back(ctx);
+                    PostClientCountLocked();
+                }
             }
         }
         pipe = INVALID_HANDLE_VALUE;
@@ -1231,11 +1392,17 @@ DWORD WINAPI PipeServer::ClientThreadStatic(LPVOID param) {
         result = ctx->self->ClientThreadNoThrow(ctx);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        DisconnectNamedPipe(ctx->pipe);
+        ctx->self->SignalWriterStop(ctx);
         result = GetExceptionCode();
     }
     ctx->self->CancelClientConfirmations(ctx->connectionId);
     ctx->self->ClientFinished(ctx);
+    // The writer may already have exited; then it is safe to close the pipe
+    // from this thread (its local handle is no longer used). If it is slow,
+    // leave the handle for StopClients/ReapClients.
+    if (ctx->writerThread &&
+        WaitForSingleObject(ctx->writerThread, 1000) == WAIT_OBJECT_0)
+        ctx->self->CloseClientPipe(ctx);
     return result;
 }
 
@@ -1243,13 +1410,146 @@ DWORD PipeServer::ClientThreadNoThrow(ClientCtx* ctx) noexcept {
     try {
         return ClientThread(ctx);
     } catch (...) {
-        DisconnectNamedPipe(ctx->pipe);
+        SignalWriterStop(ctx);
         return ERROR_UNHANDLED_EXCEPTION;
     }
 }
 
+DWORD WINAPI PipeServer::WriterThreadStatic(LPVOID param) {
+    auto* ctx = static_cast<ClientCtx*>(param);
+    DWORD result = 0;
+    __try {
+        result = ctx->self->WriterThreadNoThrow(ctx);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        ctx->writeFailed.store(true, std::memory_order_release);
+        result = GetExceptionCode();
+    }
+    // If the client thread already returned, no thread is using its local
+    // pipe handle. Close it here so an idle listener cannot leave the hook
+    // connected to a pipe with no reader. Otherwise the client thread closes
+    // it after joining this writer. ReapClients joins both thread handles
+    // before deleting ctx.
+    if (ctx->finished.load(std::memory_order_acquire))
+        ctx->self->CloseClientPipe(ctx);
+    ctx->writerFinished.store(true, std::memory_order_release);
+    return result;
+}
+
+DWORD PipeServer::WriterThreadNoThrow(ClientCtx* ctx) noexcept {
+    try {
+        return WriterThread(ctx);
+    } catch (...) {
+        ctx->writeFailed.store(true, std::memory_order_release);
+        return ERROR_UNHANDLED_EXCEPTION;
+    }
+}
+
+DWORD PipeServer::WriterThread(ClientCtx* ctx) {
+    HANDLE waits[2] = {ctx->writerStop, ctx->writerWake};
+    for (;;) {
+        const DWORD wait = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+        if (wait != WAIT_OBJECT_0 + 1) return 0;
+        for (;;) {
+            if (WaitForSingleObject(ctx->writerStop, 0) == WAIT_OBJECT_0)
+                return 0;
+            OutboundFrame frame;
+            {
+                std::lock_guard<std::mutex> lock(ctx->outboundMu);
+                if (ctx->outbound.empty()) break;
+                frame = std::move(ctx->outbound.front());
+                ctx->outbound.pop_front();
+                ctx->outboundBytes -=
+                    (std::min)(ctx->outboundBytes, frame.data.size());
+            }
+            if (!WriteAll(ctx->pipe.load(std::memory_order_acquire), frame.data)) {
+                ctx->writeFailed.store(true, std::memory_order_release);
+                return 0;
+            }
+            if (frame.deliveredVersion != 0) {
+                auto delivered = ctx->deliveredVersion.load(std::memory_order_acquire);
+                while (delivered < frame.deliveredVersion &&
+                       !ctx->deliveredVersion.compare_exchange_weak(
+                           delivered, frame.deliveredVersion,
+                           std::memory_order_acq_rel, std::memory_order_acquire)) {}
+            }
+        }
+    }
+}
+
+bool PipeServer::QueueOutbound(ClientCtx* ctx, std::string data,
+                               unsigned long long deliveredVersion) {
+    if (!ctx || !ctx->writerWake ||
+        ctx->writeFailed.load(std::memory_order_acquire) ||
+        ctx->writerFinished.load(std::memory_order_acquire) ||
+        (ctx->writerStop &&
+         WaitForSingleObject(ctx->writerStop, 0) == WAIT_OBJECT_0))
+        return false;
+    try {
+        std::lock_guard<std::mutex> lock(ctx->outboundMu);
+        if (ctx->outbound.size() >= kMaxOutboundFrames ||
+            data.size() > kMaxOutboundBytes -
+                              (std::min)(ctx->outboundBytes,
+                                         kMaxOutboundBytes))
+            return false;
+        const size_t bytes = data.size();
+        ctx->outbound.push_back(
+            OutboundFrame{std::move(data), deliveredVersion});
+        ctx->outboundBytes += bytes;
+    } catch (...) {
+        return false;
+    }
+    return SetEvent(ctx->writerWake) != FALSE;
+}
+
+void PipeServer::SignalWriterStop(ClientCtx* ctx) noexcept {
+    if (!ctx) return;
+    if (ctx->writerStop) SetEvent(ctx->writerStop);
+    if (ctx->writerThread) CancelSynchronousIo(ctx->writerThread);
+}
+
+void PipeServer::CloseClientPipe(ClientCtx* ctx) noexcept {
+    if (!ctx) return;
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    {
+        std::lock_guard<std::mutex> lock(ctx->pipeMu);
+        pipe = ctx->pipe.exchange(INVALID_HANDLE_VALUE,
+                                  std::memory_order_acq_rel);
+    }
+    if (pipe && pipe != INVALID_HANDLE_VALUE) CloseHandle(pipe);
+}
+
+bool PipeServer::JoinClient(ClientCtx* ctx, ULONGLONG deadline) noexcept {
+    const auto exited = [](HANDLE thread) {
+        return !thread || WaitForSingleObject(thread, 0) == WAIT_OBJECT_0;
+    };
+    for (;;) {
+        if (exited(ctx->thread) && exited(ctx->writerThread)) return true;
+        // Repeat cancellation: a writer can enter WriteFile after the first
+        // cancellation and can issue several writes for a large state frame.
+        SignalWriterStop(ctx);
+        if (ctx->thread) CancelSynchronousIo(ctx->thread);
+        {
+            std::lock_guard<std::mutex> lock(ctx->pipeMu);
+            HANDLE pipe = ctx->pipe.load(std::memory_order_acquire);
+            if (pipe && pipe != INVALID_HANDLE_VALUE) CancelIoEx(pipe, nullptr);
+        }
+        if (deadline && GetTickCount64() >= deadline) return false;
+        Sleep(10);
+    }
+}
+
+void PipeServer::DeleteClient(ClientCtx* ctx) noexcept {
+    if (ctx->thread) CloseHandle(ctx->thread);
+    if (ctx->writerThread) CloseHandle(ctx->writerThread);
+    if (ctx->writerWake) CloseHandle(ctx->writerWake);
+    if (ctx->writerStop) CloseHandle(ctx->writerStop);
+    CloseClientPipe(ctx);
+    delete ctx;
+}
+
 DWORD PipeServer::ClientThread(ClientCtx* ctx) {
-    HANDLE pipe = ctx->pipe;
+    HANDLE pipe = ctx->pipe.load(std::memory_order_acquire);
     std::string input;
     ULONGLONG partialSince = 0;
     ULONGLONG inboundWindowStart = GetTickCount64();
@@ -1269,6 +1569,9 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
     };
     char buffer[64 * 1024];
     for (;;) {
+        if (ctx->writeFailed.load(std::memory_order_acquire) ||
+            ctx->writerFinished.load(std::memory_order_acquire))
+            break;
         OutboundState state;
         {
             std::lock_guard<std::mutex> lock(stateMu_);
@@ -1278,7 +1581,9 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
                 std::memory_order_acquire);
             state.changed =
                 ctx->deliveredVersion.load(std::memory_order_acquire) !=
-                state.version;
+                    state.version ||
+                ctx->queuedStateVersion.load(std::memory_order_acquire) !=
+                    state.version;
             if (state.changed && !state.shuttingDown) {
                 state.rules = rulesMsg_;
                 state.rulesV3 = rulesV3Msg_;
@@ -1296,7 +1601,8 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
         }
 
         if (state.shuttingDown) {
-            if (WriteAll(pipe, ShutdownMessage())) {
+            if (!QueueOutbound(ctx, ShutdownMessage(), 0)) break;
+            {
                 // ACK confirms fail-open and Detour removal. In-flight calls
                 // retain their own module reference until they return.
                 ULONGLONG deadline = GetTickCount64() + 3000;
@@ -1350,7 +1656,9 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
             if (shuttingDown_) continue;
             break;
         }
-        if (state.changed) {
+        if (state.changed &&
+            ctx->queuedStateVersion.load(std::memory_order_acquire) !=
+                state.version) {
             const bool extended =
                 ctx->extendedCapable.load(std::memory_order_acquire);
             const bool notification =
@@ -1392,11 +1700,16 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
 
             std::string begin;
             std::string metadataSettings;
+            const bool textMetadata =
+                ctx->textMetadataCapable.load(std::memory_order_acquire);
+            const bool confirmationDeadline =
+                ctx->confirmationDeadlineCapable.load(std::memory_order_acquire);
             if (sendExtended && logVisibility && ignoreCustom &&
-                ctx->textMetadataCapable.load(std::memory_order_acquire)) {
+                (textMetadata || confirmationDeadline)) {
                 std::string payload(selectedSettings->data() + kIpcFrameHeaderSize,
                     selectedSettings->size() - kIpcFrameHeaderSize);
-                PutU8(payload, 1);
+                PutU8(payload, textMetadata ? 1 : 0);
+                if (confirmationDeadline) PutU8(payload, 1);
                 PutFrame(metadataSettings, kIpcSettings, payload);
                 selectedSettings = &metadataSettings;
             }
@@ -1406,12 +1719,19 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
                                     std::memory_order_release);
             ctx->sentLogVisibility.store(
                 sendExtended && logVisibility, std::memory_order_release);
-            if (!WriteAll(pipe, begin) || !WriteAll(pipe, selectedRules) ||
-                !WriteAll(pipe, state.pause) ||
-                !WriteAll(pipe, *selectedSettings))
+            std::string stateFrame;
+            stateFrame.reserve(begin.size() + selectedRules.size() +
+                               state.pause.size() + selectedSettings->size());
+            stateFrame.append(begin);
+            stateFrame.append(selectedRules);
+            stateFrame.append(state.pause);
+            stateFrame.append(*selectedSettings);
+            // Writer thread owns WriteFile so this reader can keep draining
+            // inbound data while a large state frame is still pending.
+            if (!QueueOutbound(ctx, std::move(stateFrame), state.version))
                 break;
-            ctx->deliveredVersion.store(state.version,
-                                        std::memory_order_release);
+            ctx->queuedStateVersion.store(state.version,
+                                          std::memory_order_release);
         }
 
         std::deque<std::string> privateRequests;
@@ -1423,7 +1743,7 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
         }
         bool responseWriteFailed = false;
         for (const auto& response : responses) {
-            if (!WriteAll(pipe, ConfirmationResponseMessage(
+            if (!QueueOutbound(ctx, ConfirmationResponseMessage(
                                     response.token, response.allow))) {
                 responseWriteFailed = true;
                 break;
@@ -1431,7 +1751,10 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
         }
         if (responseWriteFailed) break;
         for (const auto& request : privateRequests) {
-            if (!WriteAll(pipe, request)) { responseWriteFailed = true; break; }
+            if (!QueueOutbound(ctx, request)) {
+                responseWriteFailed = true;
+                break;
+            }
         }
         if (responseWriteFailed) break;
 
@@ -1463,6 +1786,8 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
                         const unsigned version = ack.version;
                         ctx->textMetadataCapable.store(ack.HasTextMetadata(),
                                                        std::memory_order_release);
+                        ctx->confirmationDeadlineCapable.store(version >= 13,
+                                                               std::memory_order_release);
                         ctx->privateClipboardCapable.store(
                             (ack.flags & kStateAckPrivateClipboardAvailable) != 0,
                             std::memory_order_release);
@@ -1489,7 +1814,11 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
                                 cryptoReady && formatsReady && shortcutPolicyReady && logVisibilityReady,
                                 std::memory_order_release);
                         } else if (!ack.extendedApplied && !sentExtended && formatsReady) {
-                            ctx->deliveredVersion.store(0, std::memory_order_release);
+                            // Force the next loop to send the extended snapshot;
+                            // otherwise the same version is deduplicated as
+                            // already queued and the hook never becomes ready.
+                            ctx->queuedStateVersion.store(0,
+                                                          std::memory_order_release);
                         }
                     }
                     offset += frame.consumed;
@@ -1521,11 +1850,19 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
                         request.preview.size() <= 300 &&
                         request.timeoutMs >= 1000 &&
                         request.timeoutMs <= 60000;
-                    if (valid && requestReader.n != 0) {
+                    if (valid && ctx->textMetadataCapable.load(std::memory_order_acquire) &&
+                        requestReader.n != 0) {
                         BYTE kind = 0;
-                        valid = ctx->textMetadataCapable.load(std::memory_order_acquire) &&
-                            requestReader.GetU8(kind) && kind <= static_cast<BYTE>(PreviewKind::Truncated);
+                        valid = requestReader.GetU8(kind) &&
+                            kind <= static_cast<BYTE>(PreviewKind::Truncated);
                         request.previewKind = static_cast<PreviewKind>(kind);
+                    }
+                    const ULONGLONG now = GetTickCount64();
+                    if (valid && ctx->confirmationDeadlineCapable.load(std::memory_order_acquire)) {
+                        valid = requestReader.GetU64(request.deadline) &&
+                            (request.deadline <= now || request.deadline - now <= 60000);
+                    } else {
+                        request.deadline = now + request.timeoutMs;
                     }
                     valid = valid && requestReader.n == 0;
                     offset += frame.consumed;
@@ -1619,7 +1956,10 @@ DWORD PipeServer::ClientThread(ClientCtx* ctx) {
         if (available == 0) Sleep(30);
     }
 
-    DisconnectNamedPipe(pipe);
+    // The listener/StopClients owns the pipe handle and closes it after both
+    // this thread and the writer exit. Avoid DisconnectNamedPipe here: it is
+    // another potentially blocking call while shutdown is trying to join us.
+    SignalWriterStop(ctx);
     return 0;
 }
 
@@ -1655,7 +1995,9 @@ void PipeServer::ReapClients() {
         auto it = clients_.begin();
         while (it != clients_.end()) {
             ClientCtx* ctx = *it;
-            if (!preserveDead && ctx->thread &&
+            const bool writerDone = !ctx->writerThread ||
+                WaitForSingleObject(ctx->writerThread, 0) == WAIT_OBJECT_0;
+            if (!preserveDead && ctx->thread && writerDone &&
                 WaitForSingleObject(ctx->thread, 0) == WAIT_OBJECT_0) {
                 dead.push_back(ctx);
                 it = clients_.erase(it);
@@ -1666,50 +2008,25 @@ void PipeServer::ReapClients() {
         PostClientCountLocked();
     }
     for (ClientCtx* ctx : dead) {
-        CloseHandle(ctx->thread);
-        CloseHandle(ctx->pipe);
-        delete ctx;
+        DeleteClient(ctx);
     }
 }
 
 void PipeServer::StopClients(bool waitForever) {
     std::vector<ClientCtx*> clients;
     {
+        std::lock_guard<std::mutex> acceptLock(acceptMu_);
         std::lock_guard<std::mutex> lock(clientsMu_);
         clients.swap(clients_);
     }
     const ULONGLONG deadline = waitForever ? 0 : GetTickCount64() + 3000;
-    for (ClientCtx* ctx : clients) CancelSynchronousIo(ctx->thread);
-
+    for (ClientCtx* ctx : clients) SignalWriterStop(ctx);
     std::vector<ClientCtx*> survivors;
     for (ClientCtx* ctx : clients) {
-        DWORD timeout = INFINITE;
-        if (!waitForever) {
-            const ULONGLONG now = GetTickCount64();
-            timeout = now >= deadline
-                          ? 0
-                          : (DWORD)(std::min)(deadline - now,
-                                               (ULONGLONG)MAXDWORD);
-        }
-        DWORD result = WaitForSingleObject(ctx->thread, timeout);
-        if (result == WAIT_OBJECT_0) {
-            CloseHandle(ctx->thread);
-            CloseHandle(ctx->pipe);
-            delete ctx;
-        } else {
-            // A timeout is not permission to detach a thread that still owns
-            // ctx->self. Cancel its synchronous I/O and retain ownership for
-            // the destructor, without TerminateThread.
-            CancelSynchronousIo(ctx->thread);
-            if (waitForever) {
-                WaitForSingleObject(ctx->thread, INFINITE);
-                CloseHandle(ctx->thread);
-                CloseHandle(ctx->pipe);
-                delete ctx;
-            } else {
-                survivors.push_back(ctx);
-            }
-        }
+        if (JoinClient(ctx, deadline))
+            DeleteClient(ctx);
+        else
+            survivors.push_back(ctx);
     }
     {
         std::lock_guard<std::mutex> lock(clientsMu_);

@@ -78,6 +78,7 @@ static std::atomic<bool> g_snapshotProtocolCapable{false};
 static std::atomic<bool> g_snapshotTransportEnabled{false};
 static std::atomic<bool> g_ignoreCustomFormats{false};
 static std::atomic<bool> g_textMetadataEnabled{false};
+static std::atomic<bool> g_confirmationDeadlineEnabled{false};
 
 static std::wstring g_processPathLower;
 static std::wstring g_processNameLower;
@@ -141,6 +142,7 @@ struct PendingConfirmationRequest {
     std::wstring preview;
     DWORD timeoutMs = 15000;
     bool timeoutBlock = true;
+    ULONGLONG deadline = 0;
 };
 
 struct ConfirmationWaiter {
@@ -148,6 +150,7 @@ struct ConfirmationWaiter {
     bool allow = false;
     bool completed = false;
     bool defaultAllow = false;
+    ULONGLONG deadline = 0;
 };
 
 static CRITICAL_SECTION g_confirmationCs;
@@ -156,6 +159,10 @@ static std::unordered_map<unsigned long long, ConfirmationWaiter*>
     g_confirmationWaiters;
 static std::atomic<unsigned long long> g_nextConfirmationToken{1};
 static constexpr size_t kConfirmationQueueCapacity = 256;
+#ifdef CLIP_TEST_EXPORTS
+static std::atomic<HANDLE> g_testCloseEntered{nullptr}, g_testCloseResume{nullptr};
+static std::atomic<HANDLE> g_testConfirmationEntered{nullptr}, g_testConfirmationResume{nullptr};
+#endif
 
 // ---- 原始 API ----
 static decltype(&OpenClipboard) Real_OpenClipboard = OpenClipboard;
@@ -170,6 +177,11 @@ static thread_local bool g_clipboardModified = false;
 static thread_local bool g_cryptoClearPending = false;
 // 本线程当前剪贴板会话是否尝试过 EmptyClipboard（含被拦截）；Open/Close 时复位。
 static thread_local bool g_clipboardEmptied = false;
+// Only an accepted CF_LOCALE from this open transaction may guide a write.
+static thread_local LCID g_writeLocale = 0;
+static thread_local bool g_writeLocaleSet = false;
+static thread_local HANDLE g_writtenAnsiText = nullptr;
+static thread_local UINT g_writtenAnsiCodePage = CP_ACP;
 // 在复制快捷键授权窗口内清空剪贴板时的所有者窗口。绑定窗口而非布尔值：
 // 其他窗口（如经 NtUserEmptyClipboard 绕过钩子的 Edit）取得所有权后不会继承授权。
 static std::atomic<HWND> g_userOwnerWindow{nullptr};
@@ -229,19 +241,23 @@ static void PrepareProcessIdentity() {
 }
 
 // 钩子仍安装时，调用方可能已经拿到旧视图指针。先留着，等拆钩并完成 rundown 再释放。
-static void* g_retiredViews[8] = {};
-static size_t g_retiredViewsCount = 0;
+// 由 worker 生命周期串行访问；使用动态容器，避免超过固定槽位后泄漏视图。
+static std::vector<void*> g_retiredViews;
 
 static void ReleaseMappedView(void* view) noexcept {
     if (g_hooksInstalled.load(std::memory_order_acquire)) {
-        if (view && g_retiredViewsCount < 8)
-            g_retiredViews[g_retiredViewsCount++] = view;
+        if (view) {
+            try {
+                g_retiredViews.push_back(view);
+            } catch (...) {
+                // 分配失败时宁可泄漏一个视图，也不要在 hooks 仍安装时 unmap。
+            }
+        }
         return;
     }
     if (view) UnmapViewOfFile(view);
-    for (size_t index = 0; index < g_retiredViewsCount; ++index)
-        UnmapViewOfFile(g_retiredViews[index]);
-    g_retiredViewsCount = 0;
+    for (void* retired : g_retiredViews) UnmapViewOfFile(retired);
+    g_retiredViews.clear();
 }
 
 static void CloseSourceMapping() noexcept {
@@ -464,10 +480,9 @@ static clip::RuleSourceIdentity CurrentClipboardSource(DWORD sequence) {
     return source;
 }
 
-static void PublishClipboardSource() noexcept {
+static void PublishClipboardSource(DWORD sequence) noexcept {
     auto* shared = g_source.load(std::memory_order_acquire);
     if (!shared) return;
-    const DWORD sequence = GetClipboardSequenceNumber();
     if (!sequence) return;
     InterlockedExchange(&shared->guard, 1);
     shared->sequence = sequence;
@@ -577,13 +592,9 @@ static void QueueCryptoBlock(clip::ClipOp op, UINT format,
                              const clip::RuleSourceIdentity* source,
                              const std::wstring& ruleName,
                              bool cryptoContent = false) noexcept {
-    // 被拦截的延迟渲染不会改变剪贴板，每次有程序读取都会重试；同一剪贴板版本只记录一次。
-    static std::atomic<DWORD> lastWriteBlockSequence{0};
+    // Every independent blocked API call reaches the bounded audit queue.
+    // The consumer owns notification throttling and bounded deduplication.
     const DWORD sequence = GetClipboardSequenceNumber();
-    if (op == clip::kOpWrite && sequence != 0 &&
-        lastWriteBlockSequence.exchange(sequence, std::memory_order_acq_rel) ==
-            sequence)
-        return;
     QueueEvent(op, format, clip::kRuleBlock, true, 0, L"",
                sequence, source, &ruleName, true, cryptoContent);
 }
@@ -684,6 +695,57 @@ static bool CaptureByteText(HANDLE h, ByteTextSnapshot* snapshot) {
     return ok;
 }
 
+// These helpers use the trampoline, never the hooked public API. Reading the
+// locale must not recurse into rules/confirmation, or change the API error.
+static LCID ClipboardLocale(HANDLE memory) noexcept {
+    const DWORD lastError = GetLastError();
+    LCID locale = 0;
+    if (memory && GlobalSize(memory) >= sizeof(LCID)) {
+        const void* data = GlobalLock(memory);
+        if (data) {
+            __try { locale = *static_cast<const LCID*>(data); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { locale = 0; }
+            GlobalUnlock(memory);
+        }
+    }
+    SetLastError(lastError);
+    return locale;
+}
+
+static UINT ClipboardLocaleCodePage(UINT format, LCID locale) noexcept {
+    const UINT fallback = format == CF_OEMTEXT ? CP_OEMCP : CP_ACP;
+    const DWORD lastError = GetLastError();
+    DWORD codePage = 0;
+    if (!locale || !GetLocaleInfoW(locale,
+            (format == CF_OEMTEXT ? LOCALE_IDEFAULTCODEPAGE : LOCALE_IDEFAULTANSICODEPAGE) |
+                LOCALE_RETURN_NUMBER,
+            reinterpret_cast<LPWSTR>(&codePage), sizeof(codePage) / sizeof(wchar_t)) ||
+        !codePage || !IsValidCodePage(codePage))
+        codePage = fallback;
+    SetLastError(lastError);
+    return codePage;
+}
+
+static UINT ClipboardCodePage(UINT format, bool writing) noexcept {
+    if (format != CF_TEXT && format != CF_OEMTEXT) return CP_ACP;
+    const DWORD lastError = GetLastError();
+    // This is the locale Windows supplies on Close when no explicit locale
+    // has been set. Never consult data from an earlier clipboard transaction.
+    const LCID locale = writing ? (g_writeLocaleSet ? g_writeLocale :
+        MAKELCID(LOWORD(reinterpret_cast<ULONG_PTR>(GetKeyboardLayout(0))), SORT_DEFAULT))
+        : ClipboardLocale(Real_GetClipboardData(CF_LOCALE));
+    const UINT codePage = ClipboardLocaleCodePage(format, locale);
+    SetLastError(lastError);
+    return codePage;
+}
+
+static void ResetWrittenText() noexcept {
+    g_writeLocale = 0;
+    g_writeLocaleSet = false;
+    g_writtenAnsiText = nullptr;
+    g_writtenAnsiCodePage = CP_ACP;
+}
+
 enum class ClipboardTextEncoding {
     none,
     ansi,
@@ -735,7 +797,9 @@ static size_t CompleteUtf8Prefix(const char* text, size_t length) {
     while (start > 0 && length - start < 3 &&
            (static_cast<unsigned char>(text[start - 1]) & 0xC0) == 0x80)
         --start;
-    if (start == 0) return length;
+    // 全是 continuation 字节：没有可保留的完整字符，按空前缀处理，
+    // 避免把无效前缀留给严格 UTF-8 解码而整体跳过内容规则。
+    if (start == 0) return 0;
     const unsigned char lead = static_cast<unsigned char>(text[start - 1]);
     const size_t need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
     return length - (start - 1) < need ? start - 1 : length;
@@ -743,7 +807,8 @@ static size_t CompleteUtf8Prefix(const char* text, size_t length) {
 
 static bool PeekClipboardText(UINT format, HANDLE memory, std::wstring& content,
                                unsigned long long& hash,
-                               bool& contentComplete, bool& textFormat) {
+                               bool& contentComplete, bool& textFormat,
+                               UINT legacyCodePage) {
     const ClipboardTextEncoding encoding = TextEncodingForFormat(format);
     textFormat = encoding != ClipboardTextEncoding::none;
     std::wstring unusedPreview;
@@ -755,10 +820,7 @@ static bool PeekClipboardText(UINT format, HANDLE memory, std::wstring& content,
     if (!CaptureByteText(memory, &snapshot)) return false;
     contentComplete = snapshot.comparable;
     const UINT codePage = encoding == ClipboardTextEncoding::utf8
-                              ? CP_UTF8
-                              : encoding == ClipboardTextEncoding::oem
-                                    ? CP_OEMCP
-                                    : CP_ACP;
+                              ? CP_UTF8 : legacyCodePage;
     const DWORD flags = encoding == ClipboardTextEncoding::utf8
                             ? MB_ERR_INVALID_CHARS
                             : 0;
@@ -793,7 +855,8 @@ static bool CopyCryptoTextBytes(HANDLE memory, BYTE* output, SIZE_T bytes) {
 
 static bool PeekCryptoAddresses(UINT format, HANDLE memory,
                                 const std::wstring& prefix, bool complete,
-                                std::vector<clip::CryptoAddress>& addresses) {
+                                std::vector<clip::CryptoAddress>& addresses,
+                                UINT legacyCodePage) {
     if (complete) return clip::ExtractCryptoAddresses(prefix, addresses);
     const auto encoding = TextEncodingForFormat(format);
     if (!memory || encoding == ClipboardTextEncoding::none) return false;
@@ -817,8 +880,8 @@ static bool PeekCryptoAddresses(UINT format, HANDLE memory,
         SIZE_T length = 0;
         while (length < size && bytes[length]) ++length;
         if (length == size && size < available) return false;
-        const UINT codePage = encoding == ClipboardTextEncoding::utf8 ? CP_UTF8 :
-                              encoding == ClipboardTextEncoding::oem ? CP_OEMCP : CP_ACP;
+        const UINT codePage = encoding == ClipboardTextEncoding::utf8
+            ? CP_UTF8 : legacyCodePage;
         const DWORD flags = codePage == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0;
         const auto* chars = reinterpret_cast<const char*>(bytes.data());
         const int count = MultiByteToWideChar(codePage, flags, chars,
@@ -1141,6 +1204,7 @@ static void ClosePipe() noexcept {
     g_notificationStateApplied.store(false, std::memory_order_release);
     g_logVisibilityStateApplied.store(false, std::memory_order_release);
     g_textMetadataEnabled.store(false, std::memory_order_release);
+    g_confirmationDeadlineEnabled.store(false, std::memory_order_release);
     g_snapshotProtocolCapable.store(false, std::memory_order_release);
     g_snapshotTransportEnabled.store(false, std::memory_order_release);
     CancelConfirmations();
@@ -1156,7 +1220,8 @@ static bool CompleteConfirmation(unsigned long long token, bool allow) {
     const auto found = g_confirmationWaiters.find(token);
     if (found != g_confirmationWaiters.end() && found->second &&
         !found->second->completed) {
-        found->second->allow = allow;
+        found->second->allow = GetTickCount64() < found->second->deadline
+            ? allow : found->second->defaultAllow;
         found->second->completed = true;
         SetEvent(found->second->event);
         completed = true;
@@ -1185,7 +1250,15 @@ static bool SendConfirmationRequests() {
         request = std::move(g_confirmationQueue.front());
         g_confirmationQueue.pop_front();
         LeaveCriticalSection(&g_confirmationCs);
-        if (!ConfirmationPending(request.token)) continue;
+#ifdef CLIP_TEST_EXPORTS
+        if (HANDLE entered = g_testConfirmationEntered.exchange(nullptr)) {
+            HANDLE resume = g_testConfirmationResume.exchange(nullptr);
+            SetEvent(entered);
+            if (resume) WaitForSingleObject(resume, 5000);
+        }
+#endif
+        if (GetTickCount64() >= request.deadline ||
+            !ConfirmationPending(request.token)) continue;
 
         std::string payload;
         clip::PutU64(payload, request.token);
@@ -1201,8 +1274,11 @@ static bool SendConfirmationRequests() {
         clip::PutU32(payload, request.timeoutMs);
         clip::PutU8(payload, request.timeoutBlock ? 1 : 0);
         if (textMetadata) clip::PutU8(payload, static_cast<BYTE>(request.previewKind));
+        if (g_confirmationDeadlineEnabled.load(std::memory_order_acquire))
+            clip::PutU64(payload, request.deadline);
         std::string frame;
         clip::PutFrame(frame, clip::kIpcConfirmRequest, payload);
+        if (GetTickCount64() >= request.deadline) continue;
         if (SendAll(frame)) continue;
         CompleteConfirmation(request.token, !request.timeoutBlock);
         return false;
@@ -1602,9 +1678,14 @@ static int PumpServerMessages() {
             BYTE textMetadata = 0;
             if (ok && r.n != 0)
                 ok = r.GetU8(textMetadata) && textMetadata <= 1;
+            BYTE confirmationDeadline = 0;
+            if (ok && r.n != 0)
+                ok = r.GetU8(confirmationDeadline) && confirmationDeadline <= 1;
             ok = ok && r.n == 0;
             if (ok) {
                 g_textMetadataEnabled.store(textMetadata != 0, std::memory_order_release);
+                g_confirmationDeadlineEnabled.store(confirmationDeadline != 0,
+                                                     std::memory_order_release);
                 g_previewEnabled.store(preview != 0, std::memory_order_release);
                 const bool wasShortcutOnly = g_shortcutOnlyMode.exchange(
                     shortcutOnly != 0, std::memory_order_acq_rel);
@@ -1663,7 +1744,7 @@ static int PumpServerMessages() {
                 if (!ackSuppressed) {
                     std::string ackPayload;
                     clip::PutU32(ackPayload,
-                                 clip::kStateAckCapabilityMarkerV12);
+                                 clip::kStateAckCapabilityMarkerV13);
                     clip::PutU8(
                         ackPayload,
                         g_extendedStateApplied.load(
@@ -1728,6 +1809,20 @@ extern "C" __declspec(dllexport) BOOL ClipHookPrivateBlockingForTest() {
 }
 extern "C" __declspec(dllexport) DWORD ClipHookPrivateDiagnosticsForTest() {
     return privateclip::Diagnostics();
+}
+extern "C" __declspec(dllexport) void ClipHookPrivatePollRaceForTest(HANDLE entered, HANDLE resume) {
+    privateclip::SetPollRaceForTest(entered, resume);
+}
+extern "C" __declspec(dllexport) void ClipHookCloseRaceForTest(HANDLE entered, HANDLE resume) {
+    g_testCloseResume.store(resume);
+    g_testCloseEntered.store(entered);
+}
+extern "C" __declspec(dllexport) void ClipHookConfirmationRaceForTest(HANDLE entered, HANDLE resume) {
+    g_testConfirmationResume.store(resume);
+    g_testConfirmationEntered.store(entered);
+}
+extern "C" __declspec(dllexport) DWORD ClipHookPrivateRegisteredHooksForTest() {
+    return privateclip::RegisteredHooksForTest();
 }
 #endif
 
@@ -2439,6 +2534,8 @@ static bool ConfirmAccess(const clip::RuleMatch& match, clip::ClipOp operation,
 #endif
     const bool defaultAllow = !match.timeoutBlock;
     if (!g_connected.load(std::memory_order_acquire)) return defaultAllow;
+    const DWORD timeoutMs = (std::clamp)(match.confirmTimeoutMs, 1000u, 60000u);
+    const ULONGLONG deadline = GetTickCount64() + timeoutMs;
 
     HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!event) return defaultAllow;
@@ -2447,7 +2544,7 @@ static bool ConfirmAccess(const clip::RuleMatch& match, clip::ClipOp operation,
     if (token == 0)
         token = g_nextConfirmationToken.fetch_add(1,
                                                    std::memory_order_relaxed);
-    ConfirmationWaiter waiter{event, defaultAllow, false, defaultAllow};
+    ConfirmationWaiter waiter{event, defaultAllow, false, defaultAllow, deadline};
     PendingConfirmationRequest request;
     try {
         request.token = token;
@@ -2466,20 +2563,20 @@ static bool ConfirmAccess(const clip::RuleMatch& match, clip::ClipOp operation,
             : content.size() > 256 ? clip::PreviewKind::Truncated : clip::PreviewKind::Text;
         request.preview = content.empty() ? L"（无可显示文本）"
                                           : DialogPreview(content);
-        request.timeoutMs = (std::clamp)(match.confirmTimeoutMs, 1000u,
-                                         60000u);
+        request.timeoutMs = timeoutMs;
+        request.deadline = deadline;
         request.timeoutBlock = match.timeoutBlock;
     } catch (...) {
         CloseHandle(event);
         return defaultAllow;
     }
-    const DWORD timeoutMs = request.timeoutMs;
 
     bool queued = false;
     EnterCriticalSection(&g_confirmationCs);
     try {
         if (g_connected.load(std::memory_order_acquire) &&
             !g_stop.load(std::memory_order_acquire) &&
+            GetTickCount64() < deadline &&
             g_confirmationQueue.size() < kConfirmationQueueCapacity) {
             g_confirmationWaiters.emplace(token, &waiter);
             try {
@@ -2500,7 +2597,9 @@ static bool ConfirmAccess(const clip::RuleMatch& match, clip::ClipOp operation,
 
     HANDLE waits[2] = {event, g_stopEvent};
     const DWORD waitCount = g_stopEvent ? 2 : 1;
-    WaitForMultipleObjects(waitCount, waits, FALSE, timeoutMs);
+    const ULONGLONG now = GetTickCount64();
+    const DWORD remaining = now < deadline ? static_cast<DWORD>(deadline - now) : 0;
+    WaitForMultipleObjects(waitCount, waits, FALSE, remaining);
 
     bool allow = defaultAllow;
     EnterCriticalSection(&g_confirmationCs);
@@ -2516,6 +2615,64 @@ static bool ConfirmAccess(const clip::RuleMatch& match, clip::ClipOp operation,
     LeaveCriticalSection(&g_confirmationCs);
     CloseHandle(event);
     return allow;
+}
+
+// An application may publish CF_TEXT before CF_LOCALE. Only re-examine the
+// handle accepted in this open transaction; never request another format or
+// trigger a previous owner's delayed rendering. Reject a locale change that
+// would turn the already accepted bytes into newly forbidden content.
+static bool CheckWrittenTextLocale(HANDLE localeMemory,
+                                   const clip::RuleSourceIdentity& source,
+                                   int state, bool directShortcutWrite) {
+    if (!localeMemory || !g_writtenAnsiText) return true;
+    const UINT codePage = ClipboardLocaleCodePage(CF_TEXT, ClipboardLocale(localeMemory));
+    if (codePage == g_writtenAnsiCodePage) return true;
+    std::wstring content, previous;
+    unsigned long long hash = 0, previousHash = 0;
+    bool textFormat = false, complete = false, previousComplete = false;
+    const bool captured = PeekClipboardText(CF_TEXT, g_writtenAnsiText, content, hash,
+                                             complete, textFormat, codePage);
+    if (captured && complete &&
+        PeekClipboardText(CF_TEXT, g_writtenAnsiText, previous, previousHash,
+                          previousComplete, textFormat, g_writtenAnsiCodePage) &&
+        previousComplete && content == previous)
+        return true;
+    if (directShortcutWrite) return true;
+    std::vector<clip::CryptoAddress> addresses;
+    const bool cryptoComplete = PeekCryptoAddresses(CF_TEXT, g_writtenAnsiText,
+        content, captured && complete, addresses, codePage);
+    const bool cryptoCandidate = cryptoComplete && !addresses.empty();
+    CryptoSnapshot baseline;
+    if (!LikelyUserClipboardWrite() && cryptoComplete &&
+        ReadCryptoSnapshot(baseline) == CryptoLookup::active &&
+        clip::HasCryptoAddressReplacement(baseline.addresses, addresses)) {
+        QueueCryptoBlock(clip::kOpWrite, CF_LOCALE, &source,
+                         g_cryptoReplacementName, true);
+        SetLastError(ERROR_ACCESS_DENIED);
+        return false;
+    }
+    clip::RuleMatch match;
+    if (state != 0)
+        match = CurrentRule(clip::kRuleWrite, true, source,
+                            captured ? &content : nullptr, complete);
+    const bool cryptoProtected = cryptoCandidate && CryptoFeatureEnabled();
+    const bool redact = match.redactContent || cryptoProtected ||
+        (captured && complete && clip::IsPrivateKeyOrMnemonicContent(content));
+    bool allow = match.action != clip::kRuleBlock;
+    if (allow && match.action == clip::kRuleConfirm)
+        allow = ConfirmAccess(match, clip::kOpWrite, CF_LOCALE, source,
+            cryptoProtected ? g_cryptoAddressPlaceholder :
+                redact ? g_sensitiveContentPlaceholder : content);
+    if (allow) return true;
+    const std::wstring preview = captured && !redact &&
+        (PreviewEnabled() || match.showNotification || match.action == clip::kRuleConfirm)
+        ? content.substr(0, 64) : L"";
+    QueueEvent(clip::kOpWrite, CF_LOCALE, static_cast<BYTE>(match.action), true,
+        redact ? 0 : hash, cryptoProtected ? g_cryptoAddressPlaceholder : preview,
+        GetClipboardSequenceNumber(), &source, &match.name,
+        match.showNotification, cryptoProtected, nullptr, match.hideFromLogList);
+    SetLastError(ERROR_ACCESS_DENIED);
+    return false;
 }
 
 static BOOL WINAPI OpenClipboard_Impl(HWND owner) {
@@ -2539,6 +2696,7 @@ static BOOL WINAPI OpenClipboard_Impl(HWND owner) {
         g_clipboardModified = false;
         g_cryptoClearPending = false;
         g_clipboardEmptied = false;
+        ResetWrittenText();
     }
     return opened;
 }
@@ -2583,13 +2741,27 @@ static BOOL WINAPI CloseClipboard_Impl() {
         ClearCryptoAddress();
         g_cryptoClearPending = false;
     }
+    // Capture while this thread still owns the OS clipboard lock. Closing can
+    // synthesize CF_LOCALE and advance the sequence; a cache miss then safely
+    // falls back to the owner instead of attributing another writer to us.
+    const DWORD sequence = g_clipboardModified ? GetClipboardSequenceNumber() : 0;
+    if (g_clipboardModified) PublishClipboardSource(sequence);
     SetLastError(incomingLastError);
     const BOOL closed = Real_CloseClipboard();
     const DWORD lastError = GetLastError();
-    if (closed && g_clipboardModified) PublishClipboardSource();
-    g_clipboardModified = false;
+#ifdef CLIP_TEST_EXPORTS
+    if (closed) {
+        if (HANDLE entered = g_testCloseEntered.exchange(nullptr)) {
+            HANDLE resume = g_testCloseResume.exchange(nullptr);
+            SetEvent(entered);
+            if (resume) WaitForSingleObject(resume, 5000);
+        }
+    }
+#endif
+    if (closed) g_clipboardModified = false;
     // 同一线程随后收到 WM_RENDERFORMAT 时属于延迟渲染补写，不再视为本线程清空过。
     g_clipboardEmptied = false;
+    if (closed) ResetWrittenText();
     SetLastError(lastError);
     return closed;
 }
@@ -2668,14 +2840,15 @@ static HANDLE WINAPI GetClipboardData_Impl(UINT fmt) {
     unsigned long long hash = 0;
     bool contentComplete = false;
     bool textFormat = false;
+    const UINT codePage = ClipboardCodePage(fmt, false);
     const bool hasContent =
-        PeekClipboardText(fmt, h, content, hash, contentComplete, textFormat);
+        PeekClipboardText(fmt, h, content, hash, contentComplete, textFormat, codePage);
     const bool sensitiveContent =
         hasContent && contentComplete &&
         clip::IsPrivateKeyOrMnemonicContent(content);
     std::vector<clip::CryptoAddress> cryptoAddresses;
     const bool cryptoComplete = textFormat && PeekCryptoAddresses(
-        fmt, h, content, hasContent && contentComplete, cryptoAddresses);
+        fmt, h, content, hasContent && contentComplete, cryptoAddresses, codePage);
     const bool cryptoCandidate = cryptoComplete && !cryptoAddresses.empty();
     CryptoSnapshot cryptoSnapshot;
     const CryptoLookup cryptoLookup = ReadCryptoSnapshot(cryptoSnapshot);
@@ -2810,18 +2983,22 @@ static HANDLE WINAPI SetClipboardData_Impl(UINT fmt, HANDLE mem) {
     source.pid = GetCurrentProcessId();
     source.nameLower = g_processNameLower;
     source.pathLower = g_processPathLower;
+    if (fmt == CF_LOCALE && !CheckWrittenTextLocale(mem, source, state,
+                                                   directShortcutWrite))
+        return nullptr;
     std::wstring content;
     unsigned long long hash = 0;
     bool contentComplete = false;
     bool textFormat = false;
+    const UINT codePage = ClipboardCodePage(fmt, true);
     const bool hasContent =
-        PeekClipboardText(fmt, mem, content, hash, contentComplete, textFormat);
+        PeekClipboardText(fmt, mem, content, hash, contentComplete, textFormat, codePage);
     const bool sensitiveContent =
         hasContent && contentComplete &&
         clip::IsPrivateKeyOrMnemonicContent(content);
     std::vector<clip::CryptoAddress> cryptoAddresses;
     const bool cryptoComplete = textFormat && PeekCryptoAddresses(
-        fmt, mem, content, hasContent && contentComplete, cryptoAddresses);
+        fmt, mem, content, hasContent && contentComplete, cryptoAddresses, codePage);
     const bool cryptoCandidate = cryptoComplete && !cryptoAddresses.empty();
     CryptoSnapshot cryptoSnapshot;
     const CryptoLookup cryptoLookup = ReadCryptoSnapshot(cryptoSnapshot);
@@ -2876,6 +3053,12 @@ static HANDLE WINAPI SetClipboardData_Impl(UINT fmt, HANDLE mem) {
     DWORD lastError = GetLastError();
     if (h) {
         g_clipboardModified = true;
+        if (fmt == CF_LOCALE) {
+            g_writeLocale = ClipboardLocale(h);
+            g_writeLocaleSet = true;
+            if (g_writtenAnsiText)
+                g_writtenAnsiCodePage = ClipboardLocaleCodePage(CF_TEXT, g_writeLocale);
+        }
         if (cryptoComplete) {
             if (cryptoCandidate)
                 PublishCryptoAddress(cryptoAddresses, GetClipboardSequenceNumber());
@@ -2897,6 +3080,10 @@ static HANDLE WINAPI SetClipboardData_Impl(UINT fmt, HANDLE mem) {
                GetClipboardSequenceNumber(), &source, &match.name,
                match.showNotification, cryptoProtectedContent, &snapshot,
                match.hideFromLogList, directShortcutWrite ? clip::BuiltinRule::CopyAllowed : clip::BuiltinRule::None);
+    if (h && fmt == CF_TEXT) {
+        g_writtenAnsiText = h;
+        g_writtenAnsiCodePage = codePage;
+    }
     SetLastError(lastError);
     return h;
 }
@@ -2951,7 +3138,7 @@ static BOOL WINAPI EmptyClipboard_Impl() {
         SetLastError(incomingLastError);
         const BOOL ok = Real_EmptyClipboard();
         const DWORD lastError = GetLastError();
-        if (ok) RecordUserOwnerWindow();
+        if (ok) { ResetWrittenText(); RecordUserOwnerWindow(); }
         SetLastError(lastError);
         return ok;
     }
@@ -2965,6 +3152,7 @@ static BOOL WINAPI EmptyClipboard_Impl() {
     BOOL ok = Real_EmptyClipboard();
     DWORD lastError = GetLastError();
     if (ok) {
+        ResetWrittenText();
         g_clipboardModified = true;
         g_cryptoClearPending = true;
         RecordUserOwnerWindow();
@@ -3190,17 +3378,10 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
         g_connected.store(false, std::memory_order_release);
         // The worker owns the pipe handle and performs the sole CloseHandle.
         // Do not enter a DLL-owned lock from DllMain during process teardown.
-        // A clean stop reaches this path only after the worker has removed all
-        // Detours, completed rundown, and released its module reference.
-        if (g_workerRunning.load(std::memory_order_acquire) == 0 &&
-            !g_hooksInstalled.load(std::memory_order_acquire) &&
-            g_pipeCsInitialized) {
-            DeleteCriticalSection(&g_qcs);
-            DeleteCriticalSection(&g_pipeCs);
-            DeleteCriticalSection(&g_confirmationCs);
-            DeleteCriticalSection(&g_workerStartCs);
-            g_pipeCsInitialized = false;
-        }
+        // Do not DeleteCriticalSection here either: UnhookWindowsHookEx may
+        // return while a GetMsgProc callback is still executing, and deleting
+        // a lock under that callback is undefined. Process teardown reclaims
+        // the storage; a fresh load reinitializes the sections in ATTACH.
     }
     return TRUE;
 }

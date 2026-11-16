@@ -55,6 +55,32 @@ struct TempConfig {
     }
 };
 
+std::vector<RuleLite> CompiledRules(const Config& config) {
+    std::vector<RuleLite> rules;
+    rules.reserve(config.rules.size());
+    for (const auto& rule : config.rules) {
+        RuleLite lite;
+        lite.patternLower = ToLower(rule.pattern);
+        lite.isPath = rule.isPath;
+        lite.action = rule.action;
+        lite.showNotification = rule.showNotification;
+        lite.hideFromLogList = rule.hideFromLogList;
+        lite.name = rule.name;
+        lite.operations = rule.operations;
+        lite.format = rule.format;
+        lite.contentPattern = rule.contentRegex;
+        lite.ignoreCase = rule.ignoreCase;
+        lite.enabled = rule.enabled;
+        lite.sourceMode = rule.sourceMode;
+        lite.sourcePatternLower = ToLower(rule.sourcePattern);
+        lite.confirmTimeoutMs = rule.confirmTimeoutMs;
+        lite.timeoutBlock = rule.timeoutBlock;
+        CHECK(CompileRuleContentRegex(lite));
+        rules.push_back(std::move(lite));
+    }
+    return rules;
+}
+
 void FirstRunConfigTests() {
     for (Language language : {Language::Chinese, Language::English}) {
         TempConfig temp;
@@ -68,21 +94,7 @@ void FirstRunConfigTests() {
         CHECK(loaded.rules[0].name == UiText(TextId::DefaultNonTextSilentRule, language));
         CHECK(loaded.rules[1].name == UiText(TextId::DefaultClipboardNotifyRule, language));
 
-        std::vector<RuleLite> rules;
-        for (const auto& rule : loaded.rules) {
-            RuleLite lite;
-            lite.patternLower = rule.pattern;
-            lite.isPath = rule.isPath;
-            lite.action = rule.action;
-            lite.showNotification = rule.showNotification;
-            lite.hideFromLogList = rule.hideFromLogList;
-            lite.name = rule.name;
-            lite.operations = rule.operations;
-            lite.format = rule.format;
-            lite.enabled = rule.enabled;
-            lite.sourceMode = rule.sourceMode;
-            rules.push_back(std::move(lite));
-        }
+        const auto rules = CompiledRules(loaded);
         for (const unsigned char operation : {kRuleRead, kRuleWrite}) {
             for (bool text : {false, true}) {
                 RuleMatch match;
@@ -249,6 +261,8 @@ struct AppProcess {
 struct MockClient {
     HANDLE pipe = INVALID_HANDLE_VALUE;
     std::atomic<bool> stop{false}, ready{false};
+    std::atomic<unsigned long long> responseToken{0};
+    std::atomic<int> responseAllow{-1};
     std::thread worker;
     ~MockClient() {
         stop.store(true);
@@ -285,11 +299,23 @@ struct MockClient {
                     if (frame.type == kIpcRulesExtended) extended = true;
                     if (frame.type == kIpcSettings) {
                         std::string ack;
-                        PutU32(ack, kStateAckCapabilityMarkerV12);
+                        PutU32(ack, kStateAckCapabilityMarkerV13);
                         PutU8(ack, extended ? 1 : 0);
                         PutU8(ack, kStateAckTextMetadataAvailable | kStateAckCryptoMappingAvailable);
                         try { Send(kIpcStateAck, ack); } catch (...) { return; }
-                        if (frame.payloadSize == 11 && frame.payload[10] == 1) ready.store(true);
+                        if (frame.payloadSize == 12 && frame.payload[10] == 1 &&
+                            frame.payload[11] == 1)
+                            ready.store(true);
+                    }
+                    if (frame.type == kIpcConfirmResponse) {
+                        Reader reader(frame.payload, frame.payloadSize);
+                        unsigned long long token = 0;
+                        BYTE allow = 0;
+                        if (!reader.GetU64(token) || !reader.GetU8(allow) ||
+                            reader.n != 0)
+                            return;
+                        responseAllow.store(allow);
+                        responseToken.store(token);
                     }
                     input.erase(0, frame.consumed);
                 }
@@ -297,10 +323,10 @@ struct MockClient {
         });
         CHECK(Wait([&] { return ready.load(); }));
     }
-    void Event(BuiltinRule builtin, PreviewKind kind) {
+    void Event(unsigned long long hash, BuiltinRule builtin, PreviewKind kind) {
         std::string payload;
         PutU32(payload, GetCurrentProcessId());
-        PutU64(payload, 0);
+        PutU64(payload, hash);
         PutU8(payload, kOpRead);
         PutU32(payload, CF_UNICODETEXT);
         PutU8(payload, kRuleBlock);
@@ -314,16 +340,127 @@ struct MockClient {
         PutU8(payload, static_cast<BYTE>(builtin)); PutU8(payload, static_cast<BYTE>(kind));
         Send(kIpcEvent, payload);
     }
-    void Confirmation() {
+    void Confirmation(unsigned long long token = 7, DWORD timeoutMs = 60000,
+                      ULONGLONG deadline = 0) {
         std::string payload;
-        PutU64(payload, 7); PutU8(payload, kOpRead); PutU32(payload, CF_UNICODETEXT);
+        PutU64(payload, token); PutU8(payload, kOpRead); PutU32(payload, CF_UNICODETEXT);
         PutU32(payload, 0); PutWStr(payload, L""); PutWStr(payload, L"");
         PutWStr(payload, L"user rule"); PutWStr(payload, L"");
-        PutU32(payload, 60000); PutU8(payload, 1);
+        PutU32(payload, timeoutMs); PutU8(payload, 1);
         PutU8(payload, static_cast<BYTE>(PreviewKind::Empty));
+        PutU64(payload, deadline ? deadline : GetTickCount64() + timeoutMs);
         Send(kIpcConfirmRequest, payload);
     }
 };
+
+void RememberedDecisionTests(const wchar_t* path, const TempConfig& temp,
+                             const std::wstring& pipeName) {
+    Config config;
+    config.settings.language = Language::English;
+    config.settings.startMinimized = true;
+    config.settings.balloonNotificationsDisabled = true;
+    config.settings.cryptoProtection = false;
+    Rule ask;
+    ask.name = L"Highest-priority confirmation";
+    ask.pattern = L"*";
+    ask.action = kRuleConfirm;
+    ask.priority = kMinRulePriority;
+    config.rules.push_back(ask);
+    CHECK(config.Save(temp.file));
+
+    const auto FindConfirmation = [&](AppProcess& app) {
+        HWND window = nullptr;
+        CHECK(Wait([&] {
+            window = Find(app.process.dwProcessId, L"ClipProtectorConfirmWnd");
+            return window && GetDlgItem(window, 4103);
+        }));
+        SendMessageW(GetDlgItem(window, 4103), BM_SETCHECK, BST_CHECKED, 0);
+        return window;
+    };
+    const auto Decision = [&](const Config& saved, const std::wstring& process) {
+        RuleMatch match;
+        CHECK(FindClipboardRule(CompiledRules(saved), ToLower(process), L"",
+                                GetCurrentProcessId(), kRuleRead, true, {},
+                                nullptr, true, match));
+        return match.action;
+    };
+
+    AppProcess app;
+    Config remembered;
+    app.Start(path);
+    {
+        MockClient client;
+        client.Connect(pipeName);
+        CHECK(Decision(config, L"languagesmoke.exe") == kRuleConfirm);
+        client.Confirmation(101);
+        HWND window = FindConfirmation(app);
+        CHECK(WindowText(GetDlgItem(window, 4103)) ==
+              UiText(TextId::RememberChoice, Language::English));
+        PostMessageW(window, WM_COMMAND, IDOK, 0);
+        CHECK(Wait([&] {
+            return client.responseToken.load() == 101 && !IsWindow(window);
+        }));
+        CHECK(client.responseAllow.load() == 1);
+        CHECK(remembered.Load(temp.file) && remembered.rules.size() == 2);
+        CHECK(remembered.rules[0].priority == kMinRulePriority);
+        CHECK(remembered.rules[1].name == ask.name);
+        CHECK(Decision(remembered, remembered.rules[0].pattern) == kRuleAllow);
+    }
+    app.Stop(true);
+
+    // Editing the first remembered rule must not make Upsert return before
+    // restoring its actual decision and the other generated-rule fields.
+    remembered.rules[0].action = kRuleBlock;
+    remembered.rules[0].showNotification = true;
+    remembered.rules[0].hideFromLogList = true;
+    remembered.rules[0].ignoreCase = false;
+    CHECK(remembered.Save(temp.file));
+    app.Start(path);
+    {
+        MockClient client;
+        client.Connect(pipeName);
+        const std::wstring process = remembered.rules[0].pattern;
+        CHECK(Decision(remembered, process) == kRuleBlock);
+
+        const ULONGLONG deadline = GetTickCount64() + 1000;
+        client.Confirmation(102, 1000, deadline);
+        HWND lateWindow = FindConfirmation(app);
+        CHECK(GetTickCount64() < deadline);
+        DWORD_PTR result = 0;
+        // Finish posts a genuine remembered Allow before expiry. The fixture
+        // holds the main thread until that message is stale, with no timer
+        // dispatch between the click and CompleteConfirmation.
+        CHECK(SendMessageTimeoutW(app.window, WM_APP + 63, 1200, 0,
+                                  SMTO_ABORTIFHUNG, 3000, &result));
+        CHECK(result == 1);
+        CHECK(Wait([&] {
+            return client.responseToken.load() == 102 && !IsWindow(lateWindow);
+        }));
+        CHECK(client.responseAllow.load() == 0);
+        Config expired;
+        CHECK(expired.Load(temp.file) && expired.rules.size() == 2);
+        CHECK(Decision(expired, process) == kRuleBlock);
+        CHECK(expired.rules[0].showNotification &&
+              expired.rules[0].hideFromLogList && !expired.rules[0].ignoreCase);
+
+        client.Confirmation(103);
+        HWND window = FindConfirmation(app);
+        PostMessageW(window, WM_COMMAND, IDOK, 0);
+        CHECK(Wait([&] {
+            return client.responseToken.load() == 103 && !IsWindow(window);
+        }));
+        CHECK(client.responseAllow.load() == 1);
+        Config updated;
+        CHECK(updated.Load(temp.file) && updated.rules.size() == 2);
+        CHECK(updated.rules[0].priority == kMinRulePriority);
+        CHECK(updated.rules[0].name == remembered.rules[0].name);
+        CHECK(!updated.rules[0].showNotification &&
+              !updated.rules[0].hideFromLogList && updated.rules[0].ignoreCase);
+        CHECK(Decision(updated, process) == kRuleAllow);
+        CHECK(updated.rules[1].name == ask.name);
+    }
+    app.Stop(true);
+}
 
 void UiTests(const wchar_t* path) {
     TempConfig temp;
@@ -350,8 +487,8 @@ void UiTests(const wchar_t* path) {
     app.Start(path);
     MockClient client;
     client.Connect(pipeName);
-    client.Event(BuiltinRule::None, PreviewKind::Text);
-    client.Event(BuiltinRule::CryptoReplacement, PreviewKind::CryptoAddress);
+    client.Event(1, BuiltinRule::None, PreviewKind::Text);
+    client.Event(2, BuiltinRule::CryptoReplacement, PreviewKind::CryptoAddress);
     HWND list = GetDlgItem(app.window, 102);
     CHECK(Wait([&] { return ListView_GetItemCount(list) == 2; }));
     CHECK(SendMessageW(app.window, WM_APP + 62, 123, 0) == 1);
@@ -402,7 +539,23 @@ void UiTests(const wchar_t* path) {
             CHECK(Wait([&] { editor = Find(app.process.dwProcessId, L"#32770");
                             return editor && WindowText(editor) == L"Edit rule"; }));
             CHECK(WindowText(GetDlgItem(editor, IDOK)) == L"Save");
-            CHECK(SetDlgItemTextW(editor, IDC_ED_RULE_NAME, L"Newest rule"));
+            CHECK(Wait([&] {
+                HWND name = GetDlgItem(editor, IDC_ED_RULE_NAME);
+                return name && WindowText(name) == L"New rule";
+            }));
+            HWND nameEdit = GetDlgItem(editor, IDC_ED_RULE_NAME);
+            DWORD_PTR sentResult = 0;
+            CHECK(SendMessageTimeoutW(nameEdit, WM_SETTEXT, 0,
+                                      reinterpret_cast<LPARAM>(L"Newest rule"),
+                                      SMTO_ABORTIFHUNG, 2000, &sentResult));
+            HWND priorityCombo = GetDlgItem(editor, IDC_CMB_PRIORITY);
+            CHECK(priorityCombo != nullptr);
+            CHECK(SendMessageW(priorityCombo, CB_GETCOUNT, 0, 0) ==
+                  clip::kMaxRulePriority - clip::kMinRulePriority + 1);
+            CHECK(SendMessageW(priorityCombo, CB_GETCURSEL, 0, 0) ==
+                  clip::kDefaultRulePriority);
+            CHECK(SendMessageW(priorityCombo, CB_SETCURSEL,
+                               clip::kMinRulePriority, 0) != CB_ERR);
             PostMessageW(editor, WM_COMMAND, IDOK, 0);
             CHECK(Wait([&] { return !IsWindow(editor); }));
             HWND ruleList = GetDlgItem(dialog, IDC_LIST_RULES);
@@ -411,8 +564,12 @@ void UiTests(const wchar_t* path) {
             PostMessageW(dialog, WM_COMMAND, IDOK, 0);
             CHECK(Wait([&] { return !IsWindow(dialog); }));
             Config savedRules;
-            CHECK(savedRules.Load(temp.file) && savedRules.rules.size() == 2);
+            CHECK(Wait([&] {
+                return savedRules.Load(temp.file) &&
+                       savedRules.rules.size() == 2;
+            }));
             CHECK(savedRules.rules[0].name == L"Newest rule");
+            CHECK(savedRules.rules[0].priority == clip::kMinRulePriority);
             CHECK(savedRules.rules[1].name == L"Existing rule");
             continue;
         }
@@ -435,6 +592,7 @@ void UiTests(const wchar_t* path) {
     app.Start(path);
     CHECK(Wait([&] { return WindowText(app.window) == L"Clipboard Protector"; }));
     app.Stop(true);
+    RememberedDecisionTests(path, temp, pipeName);
 }
 }
 
@@ -442,7 +600,7 @@ int wmain(int argc, wchar_t** argv) {
     try {
         if (argc > 1) UiTests(argv[1]);
         else UnitTests();
-        std::puts(argc > 1 ? "Language UI: menus, dialogs, live confirmation, IPC metadata, user text, rollback and restart passed."
+        std::puts(argc > 1 ? "Language UI: menus, dialogs, live confirmation, remembered decisions, late-decision expiry, IPC metadata, user text, rollback and restart passed."
                           : "Language: catalogs, persistence, legacy fallback and user text preservation passed.");
         return 0;
     } catch (const std::exception& error) {

@@ -44,6 +44,7 @@
 {IDD_RULES, IDCANCEL, TextId::Cancel},
 {IDD_RULE_EDIT, 0, TextId::EditRule2},
 {IDD_RULE_EDIT, IDC_CHK_RULE_ENABLED, TextId::EnableThisRule},
+{IDD_RULE_EDIT, IDC_LABEL_642, TextId::Priority},
 {IDD_RULE_EDIT, IDC_LABEL_619, TextId::RuleName2},
 {IDD_RULE_EDIT, IDC_LABEL_620, TextId::AccessingProcess},
 {IDD_RULE_EDIT, IDC_LABEL_621, TextId::MatchBy},

@@ -118,7 +118,7 @@ bool CheckStateAcks() {
     // Literal wire markers also cover the non-numeric CAP9 -> CA10 transition.
     const char* markers[] = {
         "CAP2", "CAP3", "CAP4", "CAP5", "CAP6", "CAP7",
-        "CAP8", "CAP9", "CA10", "CA11", "CA12"
+        "CAP8", "CAP9", "CA10", "CA11", "CA12", "CA13"
     };
     for (unsigned i = 0; i < _countof(markers); ++i) {
         const unsigned version = i + 2;
@@ -139,7 +139,7 @@ bool CheckStateAcks() {
                 if (ack.version != version || ack.extendedApplied != (applied != 0) ||
                     ack.flags != expectedFlags ||
                     ack.HasCryptoMapping() != (version == 4 || (version >= 5 && (flags & 1))) ||
-                    ack.HasTextMetadata() != (version == 12 && (flags & 4)))
+                    ack.HasTextMetadata() != (version >= 12 && (flags & 4)))
                     return false;
                 for (size_t length = 0; length < payload.size(); ++length) {
                     if (clip::ParseStateAck(payload.data(), length, ack) ||
@@ -153,7 +153,7 @@ bool CheckStateAcks() {
             }
         }
     }
-    for (const char* marker : {"CAP1", "CAP0", "CA13", "XXXX"}) {
+    for (const char* marker : {"CAP1", "CAP0", "CA14", "XXXX"}) {
         std::string payload(marker, 4);
         payload.append(2, '\0');
         clip::StateAck ack;
@@ -218,7 +218,7 @@ bool CheckCryptoObservation() {
 
 } // namespace
 
-int wmain() {
+static int RunCommonSmoke() {
     if (!clip::Settings{}.cryptoProtection ||
         !clip::Settings{}.shortcutDirectAllow) return 125;
     if (!CheckCryptoObservation()) return 126;
@@ -612,6 +612,57 @@ int wmain() {
         budgetMatchResult.name != L"budget-block-match")
         return 123;
 
+    // Twenty legal near-misses exhaust the shared wildcard budget before
+    // the twenty-first catch-all rule; consumers must still block/confirm.
+    clip::RuleLite wildcardAllow;
+    wildcardAllow.name = L"wildcard-heavy-allow";
+    wildcardAllow.patternLower = L"*" + std::wstring(128, L'a') + L"b";
+    wildcardAllow.action = clip::kRuleAllow;
+    std::vector<clip::RuleLite> wildcardRules(20, wildcardAllow);
+    clip::RuleLite wildcardBlock;
+    wildcardBlock.name = L"wildcard-catch-all-block";
+    wildcardBlock.patternLower = L"*";
+    wildcardBlock.action = clip::kRuleBlock;
+    wildcardRules.push_back(wildcardBlock);
+    const std::wstring wildcardProcess(255, L'a');
+    if (!clip::IsRuleSetSupported(wildcardRules) ||
+        clip::MatchRules(wildcardRules, wildcardProcess, L"", clip::kRuleAllow) !=
+            clip::kRuleBlock ||
+        clip::MatchClipboardRules(wildcardRules, wildcardProcess, L"",
+                                  clip::kRuleRead, nullptr, clip::kRuleAllow) !=
+            clip::kRuleBlock)
+        return 124;
+    clip::RuleMatch wildcardMatch;
+    if (!clip::FindClipboardRule(wildcardRules, wildcardProcess, L"", 84,
+                                  clip::kRuleRead, true, source, nullptr, true,
+                                  wildcardMatch) ||
+        wildcardMatch.name != wildcardBlock.name)
+        return 125;
+    wildcardRules.back().action = clip::kRuleConfirm;
+    if (!clip::FindClipboardRule(wildcardRules, wildcardProcess, L"", 84,
+                                  clip::kRuleRead, true, source, nullptr, true,
+                                  wildcardMatch) ||
+        wildcardMatch.action != clip::kRuleConfirm)
+        return 126;
+
+    // Source wildcards share the same work limit. Unknown allow matches
+    // cannot preempt a later protective rule either.
+    for (auto& rule : wildcardRules) {
+        rule.patternLower = L"reader.exe";
+        rule.sourceMode = clip::kSourceName;
+        rule.sourcePatternLower = wildcardAllow.patternLower;
+    }
+    wildcardRules.back().sourceMode = clip::kSourceAny;
+    wildcardRules.back().sourcePatternLower.clear();
+    source.nameLower = wildcardProcess;
+    if (!clip::IsRuleSetSupported(wildcardRules) ||
+        !clip::FindClipboardRule(wildcardRules, L"reader.exe", L"", 84,
+                                  clip::kRuleRead, true, source, nullptr, true,
+                                  wildcardMatch) ||
+        wildcardMatch.action != clip::kRuleConfirm)
+        return 127;
+    source.nameLower = L"writer.exe";
+
     const std::wstring mutexName =
         L"Local\\ClipboardProtector.CommonSmoke.Mutex." +
         std::to_wstring(GetCurrentProcessId()) + L"." +
@@ -996,6 +1047,71 @@ int wmain() {
     DeleteFileW(formatMigrationName);
     if (!formatsReloaded) return 109;
 
+    wchar_t priorityName[MAX_PATH] = {};
+    if (!GetTempFileNameW(tempDir, L"cps", 0, priorityName)) return 127;
+    const std::string priorityJson =
+        "{\"ruleModelVersion\":6,\"rules\":["
+        "{\"name\":\"low\",\"pattern\":\"low.exe\",\"priority\":9},"
+        "{\"name\":\"high-first\",\"pattern\":\"a.exe\",\"priority\":0},"
+        "{\"name\":\"high-second\",\"pattern\":\"b.exe\",\"priority\":0},"
+        "{\"name\":\"defaulted\",\"pattern\":\"c.exe\"}]}";
+    if (!WriteUtf8BomFile(priorityName, priorityJson)) {
+        DeleteFileW(priorityName);
+        return 127;
+    }
+    clip::Config priorityConfig;
+    const bool priorityLoaded = priorityConfig.Load(priorityName);
+    const bool priorityOrdered =
+        priorityLoaded && priorityConfig.rules.size() == 4 &&
+        priorityConfig.rules[0].name == L"high-first" &&
+        priorityConfig.rules[1].name == L"high-second" &&
+        priorityConfig.rules[2].name == L"defaulted" &&
+        priorityConfig.rules[2].priority == clip::kDefaultRulePriority &&
+        priorityConfig.rules[3].name == L"low" &&
+        priorityConfig.rules[3].priority == 9;
+    const bool prioritySaved = priorityOrdered && priorityConfig.Save(priorityName);
+    clip::Config reloadedPriority;
+    const bool priorityReloaded =
+        prioritySaved && reloadedPriority.Load(priorityName) &&
+        reloadedPriority.rules.size() == 4 &&
+        reloadedPriority.rules[0].name == L"high-first" &&
+        reloadedPriority.rules[0].priority == 0 &&
+        reloadedPriority.rules[1].name == L"high-second" &&
+        reloadedPriority.rules[2].name == L"defaulted" &&
+        reloadedPriority.rules[3].name == L"low" &&
+        reloadedPriority.rules[3].priority == 9;
+    DeleteFileW((std::wstring(priorityName) + L".bak").c_str());
+    DeleteFileW(priorityName);
+    if (!priorityReloaded) return 127;
+
+    std::vector<clip::Rule> priorityRules(4);
+    priorityRules[0].name = L"five";
+    priorityRules[0].priority = 5;
+    priorityRules[1].name = L"zero-a";
+    priorityRules[1].priority = 0;
+    priorityRules[2].name = L"one";
+    priorityRules[2].priority = 1;
+    priorityRules[3].name = L"zero-b";
+    priorityRules[3].priority = 0;
+    const std::vector<size_t> newIndex =
+        clip::SortRulesByPriority(priorityRules);
+    if (priorityRules[0].name != L"zero-a" ||
+        priorityRules[1].name != L"zero-b" ||
+        priorityRules[2].name != L"one" ||
+        priorityRules[3].name != L"five" ||
+        newIndex[0] != 3 || newIndex[1] != 0 || newIndex[2] != 2 ||
+        newIndex[3] != 1 ||
+        clip::RulePriorityGroupBegin(priorityRules, 0) != 0 ||
+        clip::RulePriorityGroupBegin(priorityRules, 1) != 2 ||
+        clip::RulePriorityGroupBegin(priorityRules, 5) != 3)
+        return 128;
+
+    clip::Rule invalidPriority;
+    invalidPriority.pattern = L"invalid.exe";
+    invalidPriority.priority = 10;
+    if (clip::IsRuleSetSupported(std::vector<clip::Rule>{invalidPriority}))
+        return 129;
+
     clip::Config preserved;
     preserved.settings.balloonNotificationsDisabled = true;
     preserved.settings.shortcutOnlyMode = true;
@@ -1143,4 +1259,11 @@ int wmain() {
         staleIdentity.error != ERROR_PROCESS_ABORTED)
         return 35;
     return 0;
+}
+
+int wmain() {
+    const int result = RunCommonSmoke();
+    if (result != 0)
+        std::fprintf(stderr, "Common smoke failed: return code %d\n", result);
+    return result;
 }

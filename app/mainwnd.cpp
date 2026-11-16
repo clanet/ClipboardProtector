@@ -430,8 +430,8 @@ static std::wstring AlwaysDecisionRuleName(const AlwaysDecision& decision,
     return name;
 }
 
-// 同一“访问进程 + 来源条件”只保留一条自动规则：已存在则改写决策并移到最前，
-// 使首次命中的结果与用户最后一次点击一致。
+// 同一“访问进程 + 来源条件”只保留一条自动规则：已存在则改写决策，并置为
+// 最高优先级，使用户最后一次点击的结果优先于触发询问的规则。
 static bool UpsertAlwaysDecisionRule(std::vector<Rule>& rules,
                                      const AlwaysDecision& decision) {
     unsigned char sourceMode = kSourceAny;
@@ -461,7 +461,17 @@ static bool UpsertAlwaysDecisionRule(std::vector<Rule>& rules,
 
     Rule rule;
     if (found) {
-        if (existing == 0) return false;  // 已是同一条规则且位于最前
+        const bool alreadyFirst =
+            rules[existing].priority == kMinRulePriority &&
+            existing ==
+                RulePriorityGroupBegin(rules, kMinRulePriority);
+        // 位置正确仍须应用用户的新决策和已被编辑的字段。
+        const Rule& current = rules[existing];
+        if (alreadyFirst && current.pattern == decision.process &&
+            current.action == decision.action && !current.showNotification &&
+            !current.hideFromLogList && current.ignoreCase &&
+            current.sourcePattern == sourcePattern)
+            return false;
         rule = std::move(rules[existing]);
         rules.erase(rules.begin() + existing);
     }
@@ -478,7 +488,9 @@ static bool UpsertAlwaysDecisionRule(std::vector<Rule>& rules,
     rule.enabled = true;
     rule.sourceMode = sourceMode;
     rule.sourcePattern = std::move(sourcePattern);
-    rules.insert(rules.begin(), std::move(rule));
+    rule.priority = static_cast<unsigned char>(kMinRulePriority);
+    const size_t insertAt = RulePriorityGroupBegin(rules, rule.priority);
+    rules.insert(rules.begin() + insertAt, std::move(rule));
     return true;
 }
 
@@ -696,6 +708,14 @@ LRESULT MainWindow::WndProc(UINT msg, WPARAM wp, LPARAM lp) {
         change.sequence = static_cast<DWORD>(wp);
         GetLocalTime(&change.time);
         RecordCryptoChange(change);
+        return 1;
+    }
+    case WM_APP + 63: {
+        // Keep the real window decision queued until after its deadline.
+        // Used by the UI smoke to exercise the final persistence guard.
+        if (confirmations_.empty()) return 0;
+        SendMessageW(confirmations_.begin()->second->hwnd(), WM_COMMAND, IDOK, 0);
+        Sleep((std::min)(static_cast<DWORD>(wp), DWORD{2000}));
         return 1;
     }
 #endif
@@ -1825,6 +1845,11 @@ void MainWindow::CompleteConfirmation(DWORD requestId, bool allow,
     const auto found = confirmations_.find(requestId);
     if (found == confirmations_.end()) return;
     const AccessConfirmationRequest& request = found->second->request();
+    // 窗口发出的决策消息可能在主窗口队列中滞留；保存前再次执行原始期限。
+    if (request.deadline != 0 && GetTickCount64() >= request.deadline) {
+        allow = !request.timeoutBlock;
+        persistDecision = false;
+    }
     if (persistDecision) {
         AlwaysDecision decision;
         decision.process = request.process;
@@ -2487,7 +2512,9 @@ void MainWindow::AddRuleFromLog(int index) {
 
     try {
         std::vector<Rule> updated = g_app.cfg.rules;
-        updated.insert(updated.begin(), std::move(rule));
+        const size_t insertAt =
+            RulePriorityGroupBegin(updated, rule.priority);
+        updated.insert(updated.begin() + insertAt, std::move(rule));
         if (!IsRuleSetSupported(updated)) {
             UiMessageBox(hwnd_, UiText(TextId::TheRuleCountFieldLengthOrTotal),
                         UiText(TextId::CouldNotAddRule), MB_ICONWARNING);
@@ -2677,14 +2704,6 @@ void MainWindow::ToggleGlobalInjection() {
     }
 
     const bool enable = !IsGlobalInjectionEnabled();
-    if (enable) {
-        const int answer = UiMessageBox(
-            hwnd_,
-            UiText(TextId::GlobalInjectionCoversCompatibleDesktopGUIProcesses),
-            UiText(TextId::EnableProtection), MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2);
-        if (answer != IDYES) return;
-    }
-
     BeginProtectionOperation(ProtectionOperation::globalInjection, !enable);
 }
 

@@ -10,10 +10,43 @@
 namespace privateclip {
 namespace {
 SRWLOCK mutex = SRWLOCK_INIT;
+struct ThreadHooks {
+    DWORD id = 0;
+    HANDLE thread = nullptr;
+    HHOOK message = nullptr, before = nullptr, after = nullptr;
+};
+std::vector<ThreadHooks> threadHooks;
+bool hooksRetiring = false;
+bool hooksUnhooking = false;
 struct Lock { Lock(){AcquireSRWLockExclusive(&mutex);} ~Lock(){ReleaseSRWLockExclusive(&mutex);} };
+
+// A registration stays stable across sessions on this thread. Re-registering
+// the same callback while an old hook is retiring cannot identify which
+// registration invoked it. Keep the three hooks until shutdown/thread exit.
+void RetireExitedThreads() noexcept {
+    for (;;) {
+        ThreadHooks retired;
+        {
+            Lock lock;
+            const auto found = std::find_if(threadHooks.begin(), threadHooks.end(),
+                [](const ThreadHooks& hooks) {
+                    return WaitForSingleObject(hooks.thread, 0) == WAIT_OBJECT_0;
+                });
+            if (found == threadHooks.end()) return;
+            retired = *found;
+            threadHooks.erase(found);
+        }
+        // A signalled thread handle proves no callback on that thread can
+        // return. The OS may already have discarded its hook handles.
+        for (HHOOK hook : {retired.message, retired.before, retired.after})
+            if (hook) UnhookWindowsHookEx(hook);
+        CloseHandle(retired.thread);
+    }
+}
 std::atomic<bool> gate{false};
 #ifdef CLIP_TEST_EXPORTS
 std::atomic<DWORD> diagnostics{0};
+std::atomic<HANDLE> testPollEntered{nullptr}, testPollResume{nullptr};
 #endif
 void Record(DWORD flags) noexcept {
 #ifdef CLIP_TEST_EXPORTS
@@ -32,8 +65,6 @@ DWORD failure = clip::kPrivateOk;
 DWORD rootThread = 0, clipboardThread = 0;
 unsigned scopes = 0;
 bool inputObserved = false;
-HHOOK messageHook = nullptr, beforeHook = nullptr, afterHook = nullptr;
-HHOOK rootMessageHook = nullptr, rootBeforeHook = nullptr, rootAfterHook = nullptr;
 std::atomic<DWORD> hookGeneration{0};
 thread_local unsigned windowDepth = 0;
 thread_local DWORD windowGeneration = 0;
@@ -43,6 +74,9 @@ DWORD derivedScan = 0, derivedTag = 0;
 thread_local unsigned inputDepth = 0;
 std::vector<HGLOBAL> owned;
 HGLOBAL pasteHandles[4] = {};
+LCID textLocale = 0;
+HGLOBAL ansiHandle = nullptr;
+UINT ansiFormat = CF_TEXT;
 constexpr UINT textFormats[] = {CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT, CF_LOCALE};
 
 static decltype(&DispatchMessageW) RealDispatchW = DispatchMessageW;
@@ -79,12 +113,11 @@ void Wipe(HGLOBAL memory) noexcept {
 void ClearHandles() noexcept {
     for (HGLOBAL h : owned) Wipe(h);
     owned.clear(); std::fill(std::begin(pasteHandles), std::end(pasteHandles), nullptr);
+    textLocale = 0; ansiHandle = nullptr;
 }
 void ReleaseSession() noexcept {
-    for (HHOOK* hook : {&messageHook, &beforeHook, &afterHook, &rootMessageHook, &rootBeforeHook, &rootAfterHook}) {
-        if (*hook) UnhookWindowsHookEx(*hook);
-        *hook = nullptr;
-    }
+    // Session release never replaces a live thread's hook registrations.
+    // In particular Arm cannot race a deferred Unhook from this session.
     ClearHandles();
     if (session) UnmapViewOfFile(session);
     if (mapping) CloseHandle(mapping);
@@ -191,10 +224,12 @@ struct InputScope {
 };
 LRESULT CALLBACK ObserveInput(int code, WPARAM removed, LPARAM parameter) {
     Call call;
+    const DWORD generation = hookGeneration.load(std::memory_order_acquire);
     if (code >= 0 && removed == PM_REMOVE && parameter) {
         const MSG& message = *reinterpret_cast<MSG*>(parameter);
         Lock lock;
-        if (session && message.message == WM_KEYDOWN &&
+        if (generation == hookGeneration.load(std::memory_order_acquire) &&
+            session && message.message == WM_KEYDOWN &&
             message.wParam == static_cast<WPARAM>(session->operation ? 'V' : 'C') &&
             static_cast<DWORD>(GetMessageExtraInfo()) == session->inputTag && Target() &&
             clip::PrivateState(session) == clip::kPrivateSending) {
@@ -210,6 +245,8 @@ LRESULT CALLBACK BeforeWindow(int code, WPARAM sent, LPARAM parameter) {
     if (code >= 0) {
         const DWORD generation = hookGeneration.load();
         if (windowGeneration != generation) { windowDepth = 0; windowGeneration = generation; }
+        // Every frame is paired on this thread, including frames that do not
+        // enter a private scope. A new session cannot inherit an old frame.
         const unsigned frame = windowDepth++;
         if (frame < _countof(windowScopes)) {
             windowScopes[frame] = false;
@@ -223,7 +260,8 @@ LRESULT CALLBACK BeforeWindow(int code, WPARAM sent, LPARAM parameter) {
                 message->message == WM_CHAR || message->message == WM_COPY ||
                 message->message == WM_PASTE || message->message == WM_COMMAND ||
                 message->message == WM_NOTIFY || message->message >= WM_USER);
-            if (session && inputObserved && related && command && Target() &&
+            if (generation == hookGeneration.load(std::memory_order_acquire) &&
+                session && inputObserved && related && command && Target() &&
                 clip::PrivateState(session) == clip::kPrivateRunning &&
                 (GetCurrentThreadId() == session->threadId || GetCurrentThreadId() == rootThread)) {
                 ++inputDepth; ++scopes;
@@ -236,6 +274,8 @@ LRESULT CALLBACK BeforeWindow(int code, WPARAM sent, LPARAM parameter) {
 }
 LRESULT CALLBACK AfterWindow(int code, WPARAM sent, LPARAM parameter) {
     Call call;
+    const DWORD generation = hookGeneration.load(std::memory_order_acquire);
+    if (windowGeneration != generation) { windowDepth = 0; windowGeneration = generation; }
     if (code >= 0 && windowDepth) {
         const unsigned frame = --windowDepth;
         if (frame < _countof(windowScopes) && windowScopes[frame]) {
@@ -274,6 +314,17 @@ BOOL WINAPI DialogA(HWND h,LPMSG msg) {
     Call call; InputScope scope(msg); BOOL result=RealDialogA(h,msg); scope.consumed=result!=FALSE; return result;
 }
 
+UINT LocaleCodePage(UINT format, LCID locale) noexcept {
+    DWORD page = 0;
+    if (!locale || !GetLocaleInfoW(locale,
+            (format == CF_OEMTEXT ? LOCALE_IDEFAULTCODEPAGE : LOCALE_IDEFAULTANSICODEPAGE) |
+                LOCALE_RETURN_NUMBER,
+            reinterpret_cast<LPWSTR>(&page), sizeof(page) / sizeof(wchar_t)) ||
+        !page || !IsValidCodePage(page))
+        return format == CF_OEMTEXT ? CP_OEMCP : CP_ACP;
+    return page;
+}
+
 bool Capture(UINT format,HGLOBAL memory) {
     const SIZE_T bytes = GlobalSize(memory);
     if (!bytes || bytes > (clip::kPrivateClipMaxChars + 1) * 4u) {
@@ -297,7 +348,9 @@ bool Capture(UINT format,HGLOBAL memory) {
         while (length < bytes && text[length]) ++length;
         if (length == bytes) { Fail(clip::kPrivateInvalidData); return false; }
         if (unicode) return true;
-        const int converted = MultiByteToWideChar(format == CF_OEMTEXT ? CP_OEMCP : CP_ACP,
+        const LCID locale = textLocale ? textLocale :
+            MAKELCID(LOWORD(reinterpret_cast<ULONG_PTR>(GetKeyboardLayout(0))), SORT_DEFAULT);
+        const int converted = MultiByteToWideChar(LocaleCodePage(format, locale),
             0, text, length, session->text, clip::kPrivateClipMaxChars);
         if (!converted && length) { Fail(clip::kPrivateInvalidData); return false; }
         length = converted;
@@ -319,7 +372,7 @@ HGLOBAL TextHandle(UINT format) {
     SIZE_T bytes=(session->length+1)*sizeof(wchar_t);
     if(format==CF_LOCALE)bytes=sizeof(LCID);
     if(format==CF_TEXT || format==CF_OEMTEXT) {
-        bytes=WideCharToMultiByte(format==CF_TEXT?CP_ACP:CP_OEMCP,0,session->text,
+        bytes=WideCharToMultiByte(LocaleCodePage(format,GetUserDefaultLCID()),0,session->text,
             static_cast<int>(session->length+1),nullptr,0,nullptr,nullptr);
         if(!bytes)return nullptr;
     }
@@ -329,7 +382,7 @@ HGLOBAL TextHandle(UINT format) {
     if(!data){GlobalFree(h);return nullptr;}
     if(format==CF_UNICODETEXT)memcpy(data,session->text,bytes);
     else if(format==CF_LOCALE)*static_cast<LCID*>(data)=GetUserDefaultLCID();
-    else WideCharToMultiByte(format==CF_TEXT?CP_ACP:CP_OEMCP,0,session->text,
+    else WideCharToMultiByte(LocaleCodePage(format,GetUserDefaultLCID()),0,session->text,
         static_cast<int>(session->length+1),static_cast<char*>(data),static_cast<int>(bytes),nullptr,nullptr);
     GlobalUnlock(h);
     try {owned.push_back(h);} catch (...) {Wipe(h);throw;}
@@ -446,10 +499,31 @@ HRESULT WINAPI OleGet(IDataObject** object) {
 }
 HRESULT WINAPI OleFlush(){Call call;return Blocking()?S_OK:RealOleFlush();}
 HRESULT WINAPI OleCurrent(IDataObject* object){Call call;return Blocking()?S_FALSE:RealOleCurrent(object);}
+bool EnsureThreadHooks(DWORD id, HMODULE module) {
+    auto found = std::find_if(threadHooks.begin(), threadHooks.end(),
+        [id](const ThreadHooks& hooks) {
+            return hooks.id == id && WaitForSingleObject(hooks.thread, 0) == WAIT_TIMEOUT;
+        });
+    if (found == threadHooks.end()) {
+        HANDLE thread = OpenThread(SYNCHRONIZE, FALSE, id);
+        if (!thread) return false;
+        try { threadHooks.push_back({id, thread}); }
+        catch (...) { CloseHandle(thread); throw; }
+        found = threadHooks.end() - 1;
+    }
+    // The vector owns even partial registrations, so no failure path drops a
+    // handle and a later session fills missing hooks without duplicating one.
+    if (!found->message) found->message = SetWindowsHookExW(WH_GETMESSAGE, ObserveInput, module, id);
+    if (!found->before) found->before = SetWindowsHookExW(WH_CALLWNDPROC, BeforeWindow, module, id);
+    if (!found->after) found->after = SetWindowsHookExW(WH_CALLWNDPROCRET, AfterWindow, module, id);
+    return found->message && found->before && found->after;
+}
+
 } // namespace
 
 void Initialize(std::atomic<LONG>* calls) noexcept {
     activeCalls=calls;
+    { Lock lock; if (threadHooks.empty() && !hooksUnhooking) hooksRetiring = false; }
     // Built-in Edit calls these zero-argument system stubs directly when
     // finishing a copy. Redirect them as well as the public user32 wrappers.
     HMODULE win32u=GetModuleHandleW(L"win32u.dll");
@@ -470,30 +544,118 @@ DWORD Diagnostics() noexcept {
     return 0;
 #endif
 }
+#ifdef CLIP_TEST_EXPORTS
+void SetPollRaceForTest(HANDLE entered, HANDLE resume) noexcept {
+    testPollResume.store(resume);
+    testPollEntered.store(entered);
+}
+DWORD RegisteredHooksForTest() noexcept {
+    Lock lock;
+    DWORD count = 0;
+    for (const auto& hooks : threadHooks)
+        count += (hooks.message ? 1 : 0) + (hooks.before ? 1 : 0) + (hooks.after ? 1 : 0);
+    return count;
+}
+#endif
 void Fault() noexcept {Lock lock;Quarantine(clip::kPrivateInvalidData);}
 void Poll() noexcept {
-    Lock lock;if(!session || scopes)return;
-    LONG state=clip::PrivateState(session);
-    if(state==clip::kPrivateCancelledBeforeInput){ReleaseSession();return;}
-    if(state==clip::kPrivateCancelled || GetTickCount64()>session->deadline) {
-        // A request cancelled before the controller commits to sending input is
-        // safe to discard. Once input may be queued, never reopen real clipboard.
-        if(InterlockedCompareExchange(&session->state,clip::kPrivateCancelledBeforeInput,
-            clip::kPrivateReady)==clip::kPrivateReady){ReleaseSession();return;}
-        Quarantine(clip::kPrivateTimedOut);
+    RetireExitedThreads();
+    {
+        Lock lock;
+        if (session && !scopes) {
+            LONG state=clip::PrivateState(session);
+            if(state==clip::kPrivateCancelledBeforeInput){ReleaseSession();}
+            else if(state==clip::kPrivateCancelled || GetTickCount64()>session->deadline) {
+                // A request cancelled before the controller commits to sending
+                // input is safe to discard. Once input may be queued, never
+                // reopen real clipboard.
+#ifdef CLIP_TEST_EXPORTS
+                if (HANDLE entered = testPollEntered.exchange(nullptr)) {
+                    HANDLE resume = testPollResume.exchange(nullptr);
+                    SetEvent(entered);
+                    if (resume) WaitForSingleObject(resume, 5000);
+                }
+#endif
+                const LONG previous = InterlockedCompareExchange(&session->state,
+                    clip::kPrivateCancelledBeforeInput, clip::kPrivateReady);
+                if (previous == clip::kPrivateReady ||
+                    clip::PrivateState(session) == clip::kPrivateCancelledBeforeInput)
+                    ReleaseSession();
+                else Quarantine(clip::kPrivateTimedOut);
+            }
+        }
     }
 }
 bool CanDetach() noexcept {
-    Poll();Lock lock;
-    if(session && !scopes && InterlockedCompareExchange(&session->state,
-        clip::kPrivateCancelledBeforeInput,clip::kPrivateReady)==clip::kPrivateReady)
-        ReleaseSession();
-    // Shutdown can arrive before the timeout. Drop the shared secret now while
-    // retaining the guard for any input or writes already queued in the host.
-    if(session)Quarantine(clip::kPrivateTimedOut);
-    return !gate.load() && liveObjects.load() == 0;
+    Poll();
+    bool canDetach = false;
+    std::vector<ThreadHooks> retired;
+    {
+        Lock lock;
+        if (hooksUnhooking) return false;
+        if(session && !scopes) {
+            // Claim Created/Ready atomically. If the controller transitions
+            // the state concurrently, re-read and only release a state that
+            // still has no input in flight.
+            for (;;) {
+                LONG state = clip::PrivateState(session);
+                if (state == clip::kPrivateCreated ||
+                    state == clip::kPrivateReady) {
+                    const LONG previous = InterlockedCompareExchange(
+                        &session->state, clip::kPrivateCancelledBeforeInput,
+                        state);
+                    if (previous != state) {
+                        if (previous == clip::kPrivateSending ||
+                            previous == clip::kPrivateRunning)
+                            break;
+                        continue;
+                    }
+                    ReleaseSession();
+                    break;
+                }
+                if (state == clip::kPrivateCancelledBeforeInput ||
+                    state == clip::kPrivateDone) {
+                    ReleaseSession();
+                }
+                break;
+            }
+        }
+        // Shutdown can arrive before the timeout. Drop the shared secret now
+        // while retaining the guard for any input or writes already queued.
+        if(session)Quarantine(clip::kPrivateTimedOut);
+        canDetach = !gate.load() && liveObjects.load() == 0;
+        if (canDetach) {
+            // Exclude Arm under the same mutex before dropping it to unhook.
+            // Unhook may wait for callbacks taking mutex, so run it outside.
+            hooksRetiring = true;
+            hooksUnhooking = true;
+            retired.swap(threadHooks);
+        }
+    }
+    for (auto& hooks : retired) {
+        for (HHOOK* hook : {&hooks.message, &hooks.before, &hooks.after})
+            if (*hook && UnhookWindowsHookEx(*hook)) *hook = nullptr;
+        if (!hooks.message && !hooks.before && !hooks.after) {
+            CloseHandle(hooks.thread);
+            hooks.thread = nullptr;
+        }
+    }
+    retired.erase(std::remove_if(retired.begin(), retired.end(),
+        [](const ThreadHooks& hooks) { return !hooks.thread; }), retired.end());
+    {
+        Lock lock;
+        // Arm is excluded while retiring, hence the destination is empty.
+        // Keep every failed handle for a later cleanup attempt.
+        if (!retired.empty()) {
+            retired.swap(threadHooks);
+            canDetach = false;
+        }
+        hooksUnhooking = false;
+    }
+    return canDetach;
 }
 void Arm(const std::wstring& name) noexcept {
+    RetireExitedThreads();
     try {
         if(name.size()>128 || name.compare(0,wcslen(clip::kPrivateClipPrefix),clip::kPrivateClipPrefix))return;
         HANDLE h=OpenFileMappingW(FILE_MAP_READ|FILE_MAP_WRITE,FALSE,name.c_str());if(!h)return;
@@ -511,7 +673,7 @@ void Arm(const std::wstring& name) noexcept {
             s->operation<=1 && s->inputTag && s->length<=clip::kPrivateClipMaxChars &&
             s->text[s->length]==0 && s->deadline>GetTickCount64() &&
             s->deadline-GetTickCount64()<=15000 && clip::PrivateState(s)==clip::kPrivateCreated;
-        if(!valid || session || scopes) {
+        if(!valid || session || scopes || hooksRetiring) {
             s->error=clip::kPrivateBusy;InterlockedExchange(&s->state,clip::kPrivateFailed);
             UnmapViewOfFile(s);CloseHandle(h);return;
         }
@@ -526,21 +688,11 @@ void Arm(const std::wstring& name) noexcept {
         HMODULE module = nullptr;
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
             reinterpret_cast<LPCWSTR>(&ObserveInput), &module);
-        if (module) {
-            hookGeneration.fetch_add(1);
-            messageHook = SetWindowsHookExW(WH_GETMESSAGE, ObserveInput, module, s->threadId);
-            beforeHook = SetWindowsHookExW(WH_CALLWNDPROC, BeforeWindow, module, s->threadId);
-            afterHook = SetWindowsHookExW(WH_CALLWNDPROCRET, AfterWindow, module, s->threadId);
-            if (frameThread != s->threadId) {
-                rootMessageHook = SetWindowsHookExW(WH_GETMESSAGE, ObserveInput, module, frameThread);
-                rootBeforeHook = SetWindowsHookExW(WH_CALLWNDPROC, BeforeWindow, module, frameThread);
-                rootAfterHook = SetWindowsHookExW(WH_CALLWNDPROCRET, AfterWindow, module, frameThread);
-            }
-        }
-        if (!messageHook || !beforeHook || !afterHook ||
-            (frameThread != s->threadId && (!rootMessageHook || !rootBeforeHook || !rootAfterHook))) {
+        if (!module || !EnsureThreadHooks(s->threadId, module) ||
+            (frameThread != s->threadId && !EnsureThreadHooks(frameThread, module))) {
             s->error=clip::kPrivateUnsupported;InterlockedExchange(&s->state,clip::kPrivateFailed);ReleaseSession();return;
         }
+        hookGeneration.fetch_add(1, std::memory_order_acq_rel);
         // A cancelled request must not be resurrected by a delayed pipe command.
         if(InterlockedCompareExchange(&s->state,clip::kPrivateReady,clip::kPrivateCreated)!=clip::kPrivateCreated)
             ReleaseSession();
@@ -585,10 +737,19 @@ bool Set(UINT format,HANDLE memory,HANDLE& result) noexcept {
     if(!Blocking())return false;result=nullptr;
     try {
         Lock lock;if(!Inside() || !opened || GetCurrentThreadId()!=clipboardThread || session->operation!=0){Deny();return true;}
-        if(format!=CF_UNICODETEXT && format!=CF_TEXT && format!=CF_OEMTEXT){SetLastError(ERROR_NOT_SUPPORTED);return true;}
+        if(format!=CF_UNICODETEXT && format!=CF_TEXT && format!=CF_OEMTEXT && format!=CF_LOCALE){SetLastError(ERROR_NOT_SUPPORTED);return true;}
         if(!memory){Fail(clip::kPrivateUnsupported);SetLastError(ERROR_NOT_SUPPORTED);return true;}
         if(owned.size()>=16){Fail(clip::kPrivateTooLarge);return true;}
-        if(!Capture(format,static_cast<HGLOBAL>(memory)))return true;
+        if(format==CF_LOCALE) {
+            if(GlobalSize(memory)<sizeof(LCID)){Fail(clip::kPrivateInvalidData);SetLastError(ERROR_INVALID_DATA);return true;}
+            const auto* locale=static_cast<const LCID*>(GlobalLock(memory));
+            if(!locale){Fail(clip::kPrivateInvalidData);return true;}
+            textLocale=*locale;GlobalUnlock(memory);
+            if(!unicode && ansiHandle && !Capture(ansiFormat,ansiHandle))return true;
+        } else {
+            if(!Capture(format,static_cast<HGLOBAL>(memory)))return true;
+            if(format==CF_TEXT || format==CF_OEMTEXT){ansiHandle=static_cast<HGLOBAL>(memory);ansiFormat=format;}
+        }
         if(std::find(owned.begin(),owned.end(),memory)==owned.end())owned.push_back(static_cast<HGLOBAL>(memory));
         result=memory;
     }catch(...){Fault();}return true;

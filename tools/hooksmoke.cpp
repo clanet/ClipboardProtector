@@ -302,6 +302,12 @@ int wmain(int argc, wchar_t** argv) {
     fwprintf(stderr, L"detach-observed=%d\n", detached ? 1 : 0);
     fflush(stderr);
     if (!detached) {
+        fwprintf(stderr,
+                 L"detach-failed wait=%lu hooks=%ld worker=%ld pipe=%ld "
+                 L"lifecycle=%ld freeze-delta=%ld freeze-us=%llu return=6\n",
+                 detachedWait, state[1], state[0], state[7], lifecycle(),
+                 freezes() - freezesBeforeStop, freezeMicros());
+        fflush(stderr);
         probe.Release();
         stopStress();
         shutdown();

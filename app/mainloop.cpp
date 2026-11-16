@@ -21,10 +21,12 @@ namespace clip {
 
 namespace {
 Tray g_tray;
-MainWindow g_wnd;
+// Destruction runs in reverse: join MainWindow's protection worker before
+// destroying coverage, and join coverage before its server dependency.
 PipeServer g_server;
 Injector g_injector;
 CoverageMonitor g_coverage;
+MainWindow g_wnd;
 bool g_comInit = false;
 std::atomic<bool> g_globalInjectionEnabled{false};
 std::atomic<bool> g_targetedInjectionMode{false};
@@ -139,11 +141,18 @@ HookRemovalResult RemoveHooksAndRestartServer(bool restrictOnFailure,
     trace.Open(L"controller-switch");
     trace.Mark("coverage.pause.begin");
     const bool coverageWasRunning = g_coverage.running();
-    if (coverageWasRunning) g_coverage.Pause();
+    HookRemovalResult result;
+    if (!g_coverage.Pause()) {
+        // The worker may still be using the server, DLL paths and entries.
+        // Keep the current protection intact and let the caller retry later.
+        result.serverRestarted = g_pipeServerRunning;
+        result.coverageRestarted = false;
+        trace.Mark("coverage.pause.failed", 0, WAIT_TIMEOUT);
+        return result;
+    }
     trace.Mark("coverage.pause.end");
     // Workers own DLL references. Remove message hooks before host threads
     // enter Detours teardown, so the global hook chain no longer spans it.
-    HookRemovalResult result;
     trace.Mark("injector.remove.begin");
     result.removed = g_injector.Remove();
     trace.Mark("injector.remove.end", result.removed);
@@ -171,7 +180,7 @@ void CleanupCreateFailure() {
     // Startup can fail after any of these objects has been initialized. Tear
     // them down in the same dependency order used by normal exit so no worker
     // can post into a destroyed window or execute an unloaded hook DLL.
-    g_coverage.Pause();
+    g_coverage.Join();
     if (g_app.injector) g_injector.Remove();
     if (g_app.server) {
         g_server.Stop();
@@ -566,7 +575,7 @@ void StopProtectionForExit() {
     ShutdownTrace trace;
     trace.Open(L"controller-exit");
     trace.Mark("coverage.pause.begin");
-    g_coverage.Pause();
+    g_coverage.Join();
     trace.Mark("coverage.pause.end");
     if (g_app.injector) {
         trace.Mark("injector.remove.begin");
@@ -632,10 +641,10 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             return 1;
         }
     } else if (!g_app.cfg.Load(g_app.cfgPath)) {
-        // Load 会把无法使用的原文件移为 .bak。移动失败时原文件仍在：继续运行会在
-        // 之后的自动保存中用默认配置覆盖它，因此提示后退出。
+        // 格式/规则错误会被 Load 移为 .bak；读取、权限或共享错误不会移动文件。
+        // 原文件仍在时继续运行会在之后的自动保存中用默认配置覆盖它，因此提示后退出。
         if (GetFileAttributesW(g_app.cfgPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
-            UiMessageBox(nullptr, UiText(TextId::CouldNotLoadOrBackUpConfiguration),
+            UiMessageBox(nullptr, UiText(TextId::CouldNotReadConfigurationFile),
                          UiText(TextId::ClipboardProtector), MB_ICONERROR);
             return 1;
         }

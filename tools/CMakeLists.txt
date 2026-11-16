@@ -29,6 +29,32 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
 endif()
 
 if(BUILD_TESTING)
+  add_library(remotelifecyclefixture SHARED remotelifecyclefixture.cpp)
+  add_executable(remotelifecyclesmoke remotelifecyclesmoke.cpp ../common/remotehook.cpp)
+  target_compile_definitions(remotelifecyclesmoke PRIVATE CLIP_TEST_REMOTE_HOOK)
+  target_link_libraries(remotelifecyclesmoke PRIVATE clip_common)
+  add_test(NAME remote_lifecycle_smoke COMMAND remotelifecyclesmoke
+    "$<TARGET_FILE:remotelifecyclefixture>")
+  set_tests_properties(remote_lifecycle_smoke PROPERTIES TIMEOUT 30)
+
+  add_executable(coveragelifecyclesmoke coveragelifecyclesmoke.cpp
+    ../app/coveragemonitor.cpp ../app/pipeserver.cpp ../common/winutil.cpp)
+  target_include_directories(coveragelifecyclesmoke PRIVATE ../app)
+  target_compile_definitions(coveragelifecyclesmoke PRIVATE
+    CLIP_TEST_COVERAGE_MONITOR CLIP_TEST_OBJECT_NAMES CLIP_TEST_RELAXED_IPC_SECURITY)
+  target_link_libraries(coveragelifecyclesmoke PRIVATE clip_common user32)
+  add_test(NAME coverage_lifecycle_smoke COMMAND coveragelifecyclesmoke)
+  set_tests_properties(coverage_lifecycle_smoke PROPERTIES TIMEOUT 15)
+
+  add_executable(pipeserversmoke pipeserversmoke.cpp
+    ../app/pipeserver.cpp ../app/confirmwnd.cpp)
+  target_include_directories(pipeserversmoke PRIVATE ../app)
+  target_compile_definitions(pipeserversmoke PRIVATE CLIP_TEST_PIPE_SERVER)
+  target_link_libraries(pipeserversmoke PRIVATE
+    clip_common user32 gdi32 dwmapi msimg32)
+  add_test(NAME pipe_server_smoke COMMAND pipeserversmoke)
+  set_tests_properties(pipe_server_smoke PROPERTIES TIMEOUT 30 RUN_SERIAL TRUE)
+
   add_executable(shutdownlifecyclesmoke shutdownlifecyclesmoke.cpp ../app/pipeserver.cpp ../common/winutil.cpp)
   target_include_directories(shutdownlifecyclesmoke PRIVATE ../app)
   target_compile_definitions(shutdownlifecyclesmoke PRIVATE CLIP_TEST_OBJECT_NAMES CLIP_TEST_RELAXED_IPC_SECURITY)

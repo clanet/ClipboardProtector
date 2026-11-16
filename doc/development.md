@@ -42,8 +42,8 @@ cmake --build build/dev/x64 --config Release --parallel
 ## 基础回归
 
 ```powershell
-ctest --test-dir build/dev/x86 -C Release -R '^(common_smoke|shutdown_detached_smoke|shutdown_retained_smoke|shutdown_disconnected_smoke|remote_unload_smoke|shutdown_trace_smoke|hook_smoke|hook_abort_smoke|detour_heap_smoke|hook_owner_smoke|hook_thread_smoke|injection_smoke)$' --output-on-failure
-ctest --test-dir build/dev/x64 -C Release -R '^(common_smoke|shutdown_detached_smoke|shutdown_retained_smoke|shutdown_disconnected_smoke|remote_unload_smoke|shutdown_trace_smoke|hook_smoke|hook_abort_smoke|detour_heap_smoke|hook_owner_smoke|hook_thread_smoke|injection_smoke)$' --output-on-failure
+ctest --test-dir build/dev/x86 -C Release -R '^(common_smoke|shutdown_detached_smoke|shutdown_retained_smoke|shutdown_disconnected_smoke|remote_unload_smoke|remote_lifecycle_smoke|coverage_lifecycle_smoke|pipe_server_smoke|shutdown_trace_smoke|hook_smoke|hook_abort_smoke|detour_heap_smoke|hook_owner_smoke|hook_thread_smoke|injection_smoke)$' --output-on-failure
+ctest --test-dir build/dev/x64 -C Release -R '^(common_smoke|shutdown_detached_smoke|shutdown_retained_smoke|shutdown_disconnected_smoke|remote_unload_smoke|remote_lifecycle_smoke|coverage_lifecycle_smoke|pipe_server_smoke|shutdown_trace_smoke|hook_smoke|hook_abort_smoke|detour_heap_smoke|hook_owner_smoke|hook_thread_smoke|injection_smoke)$' --output-on-failure
 ```
 
 `injection_smoke` 只向自己创建的子进程注入。完整复制事务子用例使用私有窗口站；如果系统拒绝创建，输出 `crypto-transactions-skipped=private-window-station-unavailable`，其余无 `OpenClipboard` 的用例仍执行。CTest 的整体通过不代表该子用例已执行。
@@ -57,6 +57,11 @@ ctest --test-dir build/dev/x64 -C Release -R '^(common_smoke|shutdown_detached_s
 `shutdown_detached_smoke`、`shutdown_retained_smoke` 和 `shutdown_disconnected_smoke` 使用独立测试进程，验证新控制端身份绑定、旧一代通信对象仍存在时启动、成功拆钩、强制回滚后的安全保留、对应关闭确认和客户端断开。测试核对管道日志中的终态，要求退出不等待完整的 5 秒；保留场景还调用未打开剪贴板的 API，验证 Hook 代码仍有效。只有这个测试目标使用 `CLIP_TEST_RELAXED_IPC_SECURITY`，给随机测试进程名下的对象提供适用于受限令牌的访问权限；正式组件不定义该宏。
 
 `remote_unload_smoke` 验证维护工具拒绝 `--execute` 后，测试子进程与其 DLL 均保持存活，直到测试进程正常退出。此工具不再执行远程 `FreeLibrary`。
+
+`remote_lifecycle_smoke` 在自建子进程中验证释放超时和取消后的引用只减一次；
+`coverage_lifecycle_smoke` 验证巡检暂停失败后仍保留线程所有权、析构等待退出；
+`pipe_server_smoke` 验证能力升级重发、不同版本的设置长度、去重缺口计数、确认期限和线程析构。
+这些测试不安装全局 Hook，也不访问系统剪贴板。
 
 Detours 的固定事务存储属于本地条件补丁，容量和更新注意事项见 [本地修改说明](../third_party/Detours/LOCAL_CHANGES.md)。
 
