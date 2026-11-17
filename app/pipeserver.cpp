@@ -1028,9 +1028,14 @@ void PipeServer::CancelClientConfirmations(
 
 bool PipeServer::QueueLogRow(LogRow row) noexcept {
     const DWORD blockedPid = row.pid;
+    const bool readAccess = row.op == kOpRead || row.op == kOpOpen;
+    // A blocked read still refers to the published clipboard revision. A
+    // blocked write can propose different content without changing that revision.
+    const bool contentIdentified = row.hash != 0 ||
+        (readAccess && row.clipboardSequence != 0);
     const bool dedupeBlocked =
         row.blocked && row.action == kRuleBlock && !row.gap &&
-        !row.hideFromLogList && blockedPid != 0 && row.hash != 0 &&
+        !row.hideFromLogList && blockedPid != 0 && contentIdentified &&
         row.missingEvents == 0;
     try {
         std::lock_guard<std::mutex> lock(eventsMu_);
@@ -1059,8 +1064,12 @@ bool PipeServer::QueueLogRow(LogRow row) noexcept {
                 found->second.action == candidate.action &&
                 found->second.ruleName == candidate.ruleName &&
                 found->second.builtinRule == candidate.builtinRule &&
-                found->second.previewKind == candidate.previewKind)
+                found->second.previewKind == candidate.previewKind) {
+                // Keep one record for a continuous read retry burst; a quiet
+                // interval starts a new record even for the same revision.
+                if (readAccess) found->second.tick = now;
                 return false;
+            }
         }
         if (events_.size() >= 8192) {
             const bool important = row.gap || row.blocked ||

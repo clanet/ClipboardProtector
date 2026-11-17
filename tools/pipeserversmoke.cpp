@@ -120,6 +120,56 @@ struct PipeServerTestAccess {
         return Check(count == 9 && missing == 18, "deduplication lost rows or gap counts");
     }
 
+    static bool BlockedReadRetries() {
+        PipeServer server;
+        LogRow row;
+        row.pid = 42;
+        row.op = kOpRead;
+        row.fmt = CF_DIB;
+        row.blocked = true;
+        row.action = kRuleBlock;
+        row.clipboardSequence = 61;
+        row.ruleName = L"deny reads";
+        if (!Check(server.QueueLogRow(row) && !server.QueueLogRow(row),
+                   "repeated hashless reads were not collapsed")) return false;
+        const ULONGLONG beforeRetry = GetTickCount64();
+        server.blockedLogState_.at(row.pid).tick = beforeRetry - 900;
+        if (!Check(!server.QueueLogRow(row) &&
+                   server.blockedLogState_.at(row.pid).tick >= beforeRetry,
+                   "read retry did not extend the quiet interval")) return false;
+        server.blockedLogState_.at(row.pid).tick = GetTickCount64() - 1001;
+        if (!Check(server.QueueLogRow(row), "read after quiet interval was hidden")) return false;
+        ++row.clipboardSequence;
+        if (!Check(server.QueueLogRow(row), "new clipboard revision was hidden")) return false;
+        row.fmt = CF_UNICODETEXT;
+        if (!Check(server.QueueLogRow(row), "different read format was hidden")) return false;
+        row.ruleName = L"another rule";
+        if (!Check(server.QueueLogRow(row), "different read rule was hidden")) return false;
+        row.sourcePid = 99;
+        if (!Check(server.QueueLogRow(row), "different read source was hidden")) return false;
+        ++row.pid;
+        if (!Check(server.QueueLogRow(row), "different reading process was hidden")) return false;
+        row.missingEvents = 7;
+        if (!Check(server.QueueLogRow(row), "read retry lost a gap report")) return false;
+        row.missingEvents = 0;
+        row.op = kOpWrite;
+        if (!Check(server.QueueLogRow(row) && server.QueueLogRow(row),
+                   "independent hashless writes were collapsed")) return false;
+        row.op = kOpOpen;
+        row.fmt = 0;
+        if (!Check(server.QueueLogRow(row) && !server.QueueLogRow(row),
+                   "repeated blocked opens were not collapsed")) return false;
+        row.clipboardSequence = 0;
+        if (!Check(server.QueueLogRow(row) && server.QueueLogRow(row),
+                   "reads with no revision or hash were collapsed")) return false;
+        unsigned count = 0;
+        unsigned long long missing = 0;
+        LogRow event;
+        while (server.PopEvent(event)) { ++count; missing += event.missingEvents; }
+        return Check(count == 13 && missing == 7,
+                     "read retry filtering lost distinct records or gap counts");
+    }
+
     struct Connection {
         PipeServer server;
         PipePair pair;
@@ -168,8 +218,10 @@ struct PipeServerTestAccess {
         ~Connection() {
             server.wnd_ = nullptr;
             if (ctx) {
+                fprintf(stderr, "protocol connection joining workers\n");
                 server.stop_ = true;
                 server.JoinClient(ctx, 0);
+                fprintf(stderr, "protocol connection workers joined\n");
                 {
                     std::lock_guard<std::mutex> lock(server.clientsMu_);
                     server.clients_.clear();
@@ -240,6 +292,7 @@ struct PipeServerTestAccess {
             for (bool metadata : {false, true}) {
                 if (version == 11 && metadata) continue;
                 Phase phase{version, metadata};
+                fprintf(stderr, "protocol CA%u metadata=%d starting\n", version, metadata);
                 Connection connection;
                 if (!connection.Start(version, metadata) ||
                     !Check(connection.Snapshot(version >= 13 ? 12 : metadata ? 11 : 10),
@@ -387,9 +440,15 @@ struct PipeServerTestAccess {
 
 int wmain() {
     clip::g_app.cfg.settings.ignoreCustomFormats = false;
+    fprintf(stderr, "deduplication starting\n");
     if (!Check(clip::PipeServerTestAccess::Deduplication(), "deduplication stage failed")) return 1;
+    fprintf(stderr, "blocked read retries starting\n");
+    if (!Check(clip::PipeServerTestAccess::BlockedReadRetries(), "blocked read retry stage failed")) return 9;
+    fprintf(stderr, "protocol starting\n");
     if (!Check(clip::PipeServerTestAccess::Protocol(), "protocol stage failed")) return 2;
+    fprintf(stderr, "destruction starting\n");
     if (!Check(clip::PipeServerTestAccess::Destruction(), "destruction stage failed")) return 3;
+    fprintf(stderr, "confirmation windows starting\n");
     WNDCLASSW ownerClass{};
     ownerClass.hInstance = GetModuleHandleW(nullptr);
     ownerClass.lpfnWndProc = OwnerProc;
